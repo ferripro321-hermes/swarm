@@ -209,6 +209,39 @@ class Engine:
                 self.store.add_event("error", f"refresh loop: {e}")
             await asyncio.sleep(cfg.refresh_min * 60)
 
+    async def bench_new_now(self) -> None:
+        """One-shot bench pass over 'new' proxies (manual trigger)."""
+        from swarm.proxies.bench import bench_proxy
+        cfg = self.settings.proxy
+        pending = self.store.get_proxies_by_state("new", limit=1000)
+        sem = asyncio.Semaphore(150)
+
+        async def one(url: str):
+            async with sem:
+                r = await bench_proxy(
+                    url,
+                    connect_timeout_s=cfg.bench.connect_timeout_s,
+                    mega_timeout_s=cfg.bench.mega_probe_timeout_s,
+                    speed_cap_mb=cfg.bench.speed_cap_mb,
+                    speed_timeout_s=cfg.bench.speed_timeout_s,
+                    min_throughput_kbps=cfg.bench.min_throughput_kbps,
+                )
+                self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms, r.throughput_kbps)
+
+        await asyncio.gather(*(one(p["url"]) for p in pending))
+        self.store.add_event("proxy", f"manual bench pass: {self.pool.stats()}")
+
+    async def enqueue_source(self, url: str) -> None:
+        """Add an extra proxy source and fetch+bench it now."""
+        self.settings.proxy.sources.append(url)
+        from swarm.proxies.sources import fetch_source, parse_proxy_lines
+        text = await fetch_source(url)
+        entries = parse_proxy_lines(text, source=url)
+        for e in entries:
+            self.store.upsert_proxy(e.url, protocol=e.protocol, source=e.source)
+        self.store.add_event("proxy", f"source {url}: {len(entries)} proxies imported")
+        await self.bench_new_now()
+
     async def shutdown(self) -> None:
         self._stopped = True
         for tasks in self._tasks:
