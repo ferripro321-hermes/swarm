@@ -1,0 +1,6 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "net: integration tests that hit the real network (deselect with -m 'not net')",
+]
+asyncio_mode = "auto"
