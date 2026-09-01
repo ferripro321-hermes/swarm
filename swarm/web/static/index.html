@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Swarm — Proxy-Rotating Downloader</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>🐝 <span class="accent">Swarm</span></h1>
+  <div class="proxy-summary" id="proxy-summary"></div>
+</header>
+
+<main>
+  <section class="card" id="new-job">
+    <h2>New download</h2>
+    <form id="job-form">
+      <input type="url" id="link" placeholder="https://mega.nz/folder/...#... or mega.nz/file/..." required>
+      <input type="text" id="dest" placeholder="Destination folder (optional)">
+      <button type="submit">Start</button>
+    </form>
+    <div id="job-msg" class="msg"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Jobs</h2>
+      <button class="ghost" onclick="loadJobs()">Refresh</button>
+    </div>
+    <div id="jobs"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>Proxy pool</h2>
+      <div class="proxy-actions">
+        <button class="ghost" onclick="importList()">Import list…</button>
+        <button class="ghost" onclick="benchNow()">Bench now</button>
+      </div>
+    </div>
+    <div id="proxy-stats" class="stats-row"></div>
+    <div id="proxy-table"></div>
+  </section>
+
+  <section class="card">
+    <h2>Event log</h2>
+    <div id="events" class="events"></div>
+  </section>
+</main>
+
+<dialog id="import-dialog">
+  <h3>Import proxies</h3>
+  <textarea id="import-text" rows="10" placeholder="http://ip:port — one per line, or socks5://"></textarea>
+  <div class="dialog-actions">
+    <button class="ghost" onclick="document.getElementById('import-dialog').close()">Cancel</button>
+    <button onclick="doImport()">Import</button>
+  </div>
+</dialog>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
