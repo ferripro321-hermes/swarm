@@ -1,11 +1,14 @@
 """Swarm entrypoint: Flask app + asyncio engine thread.
 
 Run: .venv/bin/python app.py   (port 6970 by default)
+Single-instance: a PID lock prevents two engines from double-running.
 """
 
 from __future__ import annotations
 
 import asyncio
+import signal
+import sys
 import threading
 from pathlib import Path
 
@@ -15,6 +18,7 @@ from swarm.config import load_settings
 from swarm.store import Store
 from swarm.proxies.pool import ProxyPool
 from swarm.engine.jobs import Engine
+from swarm.engine.lock import EngineLock, EngineAlreadyRunning
 from swarm.web.api import make_api_blueprint
 
 
@@ -66,14 +70,44 @@ async def _prime(pool: ProxyPool) -> None:
 
 
 def main() -> None:
+    settings = load_settings("config.yaml")
+    lock = EngineLock("data/engine.lock")
+    if not lock.acquire():
+        print("❌ Swarm engine already running (data/engine.lock). Exiting.", file=sys.stderr)
+        sys.exit(1)
+
     app, engine, loop = create_app("config.yaml")
-    host = app.engine.settings.server.host
-    port = app.engine.settings.server.port
+    host = settings.server.host
+    port = settings.server.port
     print(f"🚂 Swarm listening on http://{host}:{port}")
+
+    _shutting_down = {"v": False}
+
+    def _handle_signal(signum, frame):
+        if _shutting_down["v"]:
+            return
+        _shutting_down["v"] = True
+        print(f"\n👋 signal {signum} — shutting down engine…")
+        try:
+            fut = asyncio.run_coroutine_threadsafe(engine.shutdown(), loop)
+            fut.result(timeout=10)
+        except Exception:
+            pass
+        lock.release()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
     try:
         app.run(host=host, port=port, threaded=True, use_reloader=False)
     finally:
-        asyncio.run_coroutine_threadsafe(engine.shutdown(), loop).result(timeout=10)
+        if not _shutting_down["v"]:
+            try:
+                asyncio.run_coroutine_threadsafe(engine.shutdown(), loop).result(timeout=10)
+            except Exception:
+                pass
+            lock.release()
 
 
 if __name__ == "__main__":
