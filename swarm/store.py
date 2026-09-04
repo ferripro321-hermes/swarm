@@ -177,7 +177,6 @@ class Store:
                 """INSERT INTO proxies (url, protocol, source, country, asn, exit_ip, created_at, updated_at)
                    VALUES (?,?,?,?,?,?,?,?)
                    ON CONFLICT(url) DO UPDATE SET
-                     source=excluded.source,
                      country=COALESCE(excluded.country, proxies.country),
                      asn=COALESCE(excluded.asn, proxies.asn),
                      exit_ip=COALESCE(excluded.exit_ip, proxies.exit_ip),

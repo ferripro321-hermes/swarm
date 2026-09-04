@@ -56,8 +56,31 @@ Downloads real bytes and reports rotation stats — the acceptance test for the 
 | proxy.bench | min_throughput_kbps | 250 | below this → dead |
 | proxy.bench | speed_url | mega.nz/secureboot.js | MEGA edge asset used to measure throughput |
 | downloads | dest | data/downloads | default download root |
+| nord | user / password | — | NordVPN **service credentials** (Nord dashboard → manual setup) |
+| nord | countries | ES FR DE BE NL SE | countries to scan for proxy-enabled servers |
+| nord | port89 | true | probe undocumented TLS-CONNECT proxy (port 89) |
+| nord | scan_concurrency | 120 | parallel auth probes during the port-89 scan |
 
 Env overrides: `SWARM_<SECTION>_<KEY>` (e.g. `SWARM_SERVER_PORT=8080`).
+
+### NordVPN endpoints
+
+With service credentials configured (`config.yaml` → `nord:`, see
+`config.example.yaml`), Swarm adds two Nord proxy surfaces to the pool and
+benches/leases them like any other proxy (highest score first):
+
+- `*.socks.nordhold.net:1080` — Nord's officially supported SOCKS5 list
+- `https://user:pass@<server>.nordvpn.com:89` — undocumented TLS-wrapped HTTP
+  CONNECT proxy on the ~5% of servers Nord flags with the "proxy" service in
+  its public API. Routed by a custom connector: permissive TLS toward the
+  proxy, strict verified TLS toward MEGA.
+
+Curated-set etiquette: Nord rate-limits auth per source IP, so Nord endpoints
+are benched at concurrency 4 (the public haystack still floods at 150), and
+each refresh pass re-verifies them — a rate-limited endpoint returns on a
+later pass instead of staying dead. "Server hopping" is normal lease
+rotation: a quota-burned Nord exit cools down while the next-best exit
+leases instantly.
 
 ## API
 

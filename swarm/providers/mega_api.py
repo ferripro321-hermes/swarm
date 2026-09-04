@@ -57,13 +57,42 @@ class MegaClient:
 
     async def api(self, payload: list | dict, handle: str | None = None,
                   proxy: str | None = None) -> list | dict:
-        """POST one cs command batch; map MEGA numeric errors to exceptions."""
+        """POST one cs command batch; map MEGA numeric errors to exceptions.
+
+        Routing per proxy dialect (see swarm.proxies.tls_connect):
+          None           -> own session, direct
+          socks5://...   -> temporary ProxyConnector session per call
+          https://...    -> own session + TLSProxyConnector + per-request proxy
+          http://...     -> own session + per-request proxy
+        """
         self._seq += 1
         url = f"{MEGA_API_URL}?id={self._seq}"
         if handle:
             url += f"&n={handle}"
         body = json.dumps(payload if isinstance(payload, list) else [payload])
+        if proxy and proxy.startswith(("socks5://", "socks4://")):
+            from swarm.proxies.tls_connect import proxied_session
+            session, _ = proxied_session(proxy, timeout_s=self._timeout_s)
+            try:
+                return await self._api_via(session, url, body)
+            finally:
+                await session.close()
+        if proxy:
+            session = await self._with_tls_connector(proxy)
+            try:
+                return await self._api_via(session, url, body, proxy=proxy)
+            finally:
+                await session.close()
         http = await self._http()
+        return await self._api_via(http, url, body)
+
+    async def _with_tls_connector(self, proxy: str):
+        from swarm.proxies.tls_connect import TLSProxyConnector
+        return aiohttp.ClientSession(
+            connector=TLSProxyConnector(),
+            timeout=aiohttp.ClientTimeout(total=self._timeout_s))
+
+    async def _api_via(self, http, url: str, body: str, proxy: str | None = None) -> list | dict:
         async with http.post(url, data=body, proxy=proxy,
                              timeout=aiohttp.ClientTimeout(total=self._timeout_s)) as resp:
             if resp.status == 509:

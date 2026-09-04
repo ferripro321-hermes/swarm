@@ -52,11 +52,26 @@ class DownloadsConfig:
 
 
 @dataclass
+class NordConfig:
+    """NordVPN proxy endpoints (service credentials from the Nord dashboard)."""
+    user: str = ""
+    password: str = ""
+    countries: list[str] = field(default_factory=lambda: ["ES", "FR", "DE", "BE", "NL", "SE"])
+    port89: bool = True              # scan undocumented TLS-CONNECT (port 89) servers
+    scan_concurrency: int = 120
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.user and self.password)
+
+
+@dataclass
 class Settings:
     server: ServerConfig = field(default_factory=ServerConfig)
     engine: EngineConfig = field(default_factory=EngineConfig)
     proxy: ProxyConfig = field(default_factory=ProxyConfig)
     downloads: DownloadsConfig = field(default_factory=DownloadsConfig)
+    nord: NordConfig = field(default_factory=NordConfig)
     db_path: str = "data/swarm.db"
 
 
@@ -71,6 +86,11 @@ def _apply_section(dc, data: dict | None, prefix: str) -> None:
         current = getattr(dc, attr)
         if isinstance(current, bool):
             setattr(dc, attr, str(value).lower() in ("1", "true", "yes"))
+        elif isinstance(current, list):
+            # list attrs (e.g. nord.countries): accept YAML lists or comma strings
+            if isinstance(value, str):
+                value = [v.strip() for v in value.split(",") if v.strip()]
+            setattr(dc, attr, value)
         elif isinstance(current, int) and not isinstance(current, bool):
             setattr(dc, attr, int(str(value)))
         elif isinstance(current, float):
@@ -94,6 +114,7 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     _apply_section(settings.proxy, proxy_raw, "PROXY")
     _apply_section(settings.proxy.bench, bench_raw if isinstance(bench_raw, dict) else {}, "BENCH")
     _apply_section(settings.downloads, raw.get("downloads"), "DOWNLOADS")
+    _apply_section(settings.nord, raw.get("nord"), "NORD")
     env_db = os.getenv("SWARM_DB_PATH")
     if env_db:
         settings.db_path = env_db

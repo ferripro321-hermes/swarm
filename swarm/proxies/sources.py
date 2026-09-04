@@ -46,8 +46,9 @@ def parse_proxy_lines(text: str, source: str = "") -> list[ProxyEntry]:
         if not m:
             continue
         proto = (m.group("proto") or "http").lower()
-        if proto == "https":
-            proto = "http"  # public lists label CONNECT proxies as https; aiohttp uses http:// for them
+        # NOTE: https:// stays https:// — it means TLS-wrapped HTTP CONNECT
+        # (NordVPN port-89 style), routed by swarm.proxies.tls_connect.
+        # Only bare 'user:pass@host:port' lines default to plain http.
         url = _normalize(proto, m.group("user"), m.group("pass"),
                          m.group("host"), m.group("port"))
         if url not in entries:

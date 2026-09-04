@@ -179,8 +179,34 @@ class Engine:
         from swarm.proxies.bench import bench_proxy
 
         cfg = self.settings.proxy
+        nord = None
+        if getattr(self.settings, "nord", None) and self.settings.nord.enabled:
+            from swarm.proxies.nord import NordProvider
+            nord = NordProvider(self.settings.nord.user, self.settings.nord.password,
+                                countries=self.settings.nord.countries,
+                                port89=self.settings.nord.port89,
+                                scan_concurrency=self.settings.nord.scan_concurrency)
+            self.store.add_event("proxy", "nord provider enabled (socks.nordhold.net + port89 scan)")
+
         while not self._stopped:
             try:
+                # Nord endpoints first: alive-verified by their own probes,
+                # so dead rows can be re-queued (public lists never get this)
+                if nord is not None:
+                    try:
+                        nord_urls = await nord.endpoints()
+                        for u in nord_urls:
+                            row = self.store.get_proxy(u)
+                            if row is None:
+                                self.store.upsert_proxy(u, protocol=("socks5" if u.startswith("socks5") else "https"),
+                                                        source="nord")
+                                self.store.set_proxy_state(u, "new")
+                            elif row["state"] == "dead":
+                                self.store.set_proxy_state(u, "new")
+                        self.store.add_event("proxy", f"nord endpoints alive: {len(nord_urls)}")
+                    except Exception as e:
+                        self.store.add_event("error", f"nord provider: {e}")
+
                 entries = await fetch_all_sources(cfg.sources)
                 fresh = [e for e in entries if self.store.get_proxy(e.url) is None]
                 for e in entries:   # remember all (even old) for dedup
@@ -192,23 +218,37 @@ class Engine:
                 bench_urls = [e.url for e in fresh]
                 bench_urls += [p["url"] for p in self.store.get_proxies_by_state("new", limit=5000)]
                 bench_urls = list(dict.fromkeys(bench_urls))   # dedupe, keep order
-                sem = asyncio.Semaphore(150)
 
-                async def bench_one(url: str):
-                    async with sem:
-                        r = await bench_proxy(
-                            url,
-                            connect_timeout_s=cfg.bench.connect_timeout_s,
-                            mega_timeout_s=cfg.bench.mega_probe_timeout_s,
-                            speed_cap_mb=cfg.bench.speed_cap_mb,
-                            speed_timeout_s=cfg.bench.speed_timeout_s,
-                            min_throughput_kbps=cfg.bench.min_throughput_kbps,
-                            speed_url=cfg.bench.speed_url,
-                        )
-                        self.pool.add_result(url, r.ok, grade_from(r),
-                                             r.latency_ms, r.throughput_kbps)
+                def _is_nord(u: str) -> bool:
+                    return "nordvpn.com:" in u or "nordhold.net:" in u
 
-                await asyncio.gather(*(bench_one(u) for u in bench_urls))
+                nord_bench = [u for u in bench_urls if _is_nord(u)]
+                public_bench = [u for u in bench_urls if not _is_nord(u)]
+
+                async def bench_many(urls: list[str], conc: int) -> None:
+                    sem = asyncio.Semaphore(conc)
+
+                    async def one(url: str):
+                        async with sem:
+                            r = await bench_proxy(
+                                url,
+                                connect_timeout_s=cfg.bench.connect_timeout_s,
+                                mega_timeout_s=cfg.bench.mega_probe_timeout_s,
+                                speed_cap_mb=cfg.bench.speed_cap_mb,
+                                speed_timeout_s=cfg.bench.speed_timeout_s,
+                                min_throughput_kbps=cfg.bench.min_throughput_kbps,
+                                speed_url=cfg.bench.speed_url,
+                            )
+                            self.pool.add_result(url, r.ok, grade_from(r),
+                                                 r.latency_ms, r.throughput_kbps)
+
+                    await asyncio.gather(*(one(u) for u in urls))
+
+                # public haystack: wide flood. Nord curated set: gentle — their
+                # auth endpoints rate-limit per source IP, and a flood of
+                # concurrent handshakes 407s even valid endpoints into "dead".
+                await bench_many(public_bench, 150)
+                await bench_many(nord_bench, 4)
                 self.store.add_event("proxy", f"bench pass done; pool stats: {self.pool.stats()}")
             except Exception as e:
                 self.store.add_event("error", f"refresh loop: {e}")
@@ -218,23 +258,31 @@ class Engine:
         """One-shot bench pass over 'new' proxies (manual trigger)."""
         from swarm.proxies.bench import bench_proxy
         cfg = self.settings.proxy
-        pending = self.store.get_proxies_by_state("new", limit=1000)
-        sem = asyncio.Semaphore(150)
+        pending = self.store.get_proxies_by_state("new", limit=5000)
 
-        async def one(url: str):
-            async with sem:
-                r = await bench_proxy(
-                    url,
-                    connect_timeout_s=cfg.bench.connect_timeout_s,
-                    mega_timeout_s=cfg.bench.mega_probe_timeout_s,
-                    speed_cap_mb=cfg.bench.speed_cap_mb,
-                    speed_timeout_s=cfg.bench.speed_timeout_s,
-                    min_throughput_kbps=cfg.bench.min_throughput_kbps,
-                    speed_url=cfg.bench.speed_url,
-                )
-                self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms, r.throughput_kbps)
+        def _is_nord(u: str) -> bool:
+            return "nordvpn.com:" in u or "nordhold.net:" in u
 
-        await asyncio.gather(*(one(p["url"]) for p in pending))
+        nord_bench = [p["url"] for p in pending if _is_nord(p["url"])]
+        public_bench = [p["url"] for p in pending if not _is_nord(p["url"])]
+        # see refresh_proxies_forever: nord auth rate-limits per source IP
+        for urls, conc in ((public_bench, 150), (nord_bench, 4)):
+            sem = asyncio.Semaphore(conc)
+
+            async def one(url: str):
+                async with sem:
+                    r = await bench_proxy(
+                        url,
+                        connect_timeout_s=cfg.bench.connect_timeout_s,
+                        mega_timeout_s=cfg.bench.mega_probe_timeout_s,
+                        speed_cap_mb=cfg.bench.speed_cap_mb,
+                        speed_timeout_s=cfg.bench.speed_timeout_s,
+                        min_throughput_kbps=cfg.bench.min_throughput_kbps,
+                        speed_url=cfg.bench.speed_url,
+                    )
+                    self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms, r.throughput_kbps)
+
+            await asyncio.gather(*(one(u) for u in urls))
         self.store.add_event("proxy", f"manual bench pass: {self.pool.stats()}")
 
     async def enqueue_source(self, url: str) -> None:
@@ -262,14 +310,17 @@ def grade_from(result) -> float:
 
 
 async def _http_cdn_get(url, headers=None, proxy=None):
-    """Real CDN GET through a proxy — injected into ChunkWorker."""
+    """Real CDN GET through a leased proxy — all dialects (socks5/http/https-TLS)."""
     import aiohttp
-    from aiohttp_socks import ProxyConnector
 
-    connector = ProxyConnector.from_url(proxy) if proxy else None
-    session = aiohttp.ClientSession(connector=connector)
+    from swarm.proxies.tls_connect import proxied_session
+
+    session, per_req_proxy = proxied_session(proxy, timeout_s=60)
     try:
-        resp = await session.get(url, headers=headers)
+        if per_req_proxy:
+            resp = await session.get(url, headers=headers, proxy=per_req_proxy)
+        else:
+            resp = await session.get(url, headers=headers)
         # wrap resp so __aexit__ closes the session too
         class _Resp:
             def __init__(self, resp, session):

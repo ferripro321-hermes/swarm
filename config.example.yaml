@@ -1,0 +1,29 @@
+# Swarm example config — copy to config.yaml and fill in.
+# config.yaml is gitignored (it may contain NordVPN service credentials).
+server:
+  port: 6970
+
+# Optional: NordVPN proxy endpoints (service credentials — the manual-config
+# user/pass from the Nord dashboard, NOT your account email).
+# Adds: *.socks.nordhold.net SOCKS5 hosts + undocumented TLS-CONNECT (port 89)
+# proxy-enabled servers in the listed countries. Swarm benches whatever it
+# finds and rotates leases as usual; "server hopping" = lease rotation.
+nord:
+  user: ""
+  password: ""
+  countries: [ES, FR, DE, BE, NL, SE]
+  port89: true            # probe port 89 on proxy-flagged servers
+  scan_concurrency: 120
+
+engine:
+  max_parallel_files: 3
+  workers_per_file: 4
+
+proxy:
+  sources:                # public list URLs (can be an empty list [])
+    - https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt
+    - https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000
+  refresh_min: 30
+  bench:
+    speed_url: https://mega.nz/secureboot.js
+    min_throughput_kbps: 250

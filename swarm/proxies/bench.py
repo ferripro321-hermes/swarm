@@ -22,7 +22,8 @@ import time
 from dataclasses import dataclass
 
 import aiohttp
-from aiohttp_socks import ProxyConnector
+
+from swarm.proxies.tls_connect import proxied_session
 
 MEGA_API_PROBE = "https://g.api.mega.co.nz/cs?id=0"   # returns [-4]-ish JSON or error; status 200 is enough
 SPEED_URL = "https://mega.nz/secureboot.js"            # static MEGA edge asset (~194 KB), no key/quota
@@ -110,16 +111,17 @@ async def bench_proxy(url: str, connect_timeout_s: float = 5.0,
                       min_throughput_kbps: float = 250.0,
                       speed_url: str = SPEED_URL) -> BenchResult:
     try:
-        connector = ProxyConnector.from_url(url)
+        session, per_req_proxy = proxied_session(url, timeout_s=(
+            connect_timeout_s + mega_timeout_s + speed_timeout_s + 5))
     except Exception as e:
         return BenchResult(url, ok=False, stage_failed="connect", error=str(e)[:120])
 
-    timeout = aiohttp.ClientTimeout(total=connect_timeout_s + mega_timeout_s + speed_timeout_s + 5)
     try:
-        # Proxying is bound via the connector only — never also pass proxy= per
-        # request (aiohttp forbids mixing a proxy connector with proxy=).
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            get = session.get
+        # Proxying is bound by the session's connector (+ per-request proxy for
+        # http/https CONNECT dialects). Never proxy="socks5://..." per request —
+        # aiohttp speaks HTTP at SOCKS ports.
+        async with session:
+            get = lambda u, **kw: session.get(u, proxy=per_req_proxy, **kw)  # noqa: E731
 
             # stage 1+2 combined: a GET to the MEGA API through the proxy
             try:
