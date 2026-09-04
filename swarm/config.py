@@ -38,6 +38,9 @@ class BenchConfig:
 class ProxyConfig:
     ban_ttl_h: float = 6.0
     fail_ban_after: int = 3
+    # mode: "public" = public proxy lists only; "nord" = NordVPN endpoints only.
+    # Either/or — no mixing. (Nord mode requires nord.user/password.)
+    mode: str = "public"
     sources: list[str] = field(default_factory=lambda: [
         "https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/all.txt",
         "https://api.proxyscrape.com/v2/?request=displayproxies&protocol=http&timeout=5000",
@@ -59,6 +62,7 @@ class NordConfig:
     countries: list[str] = field(default_factory=lambda: ["ES", "FR", "DE", "BE", "NL", "SE"])
     port89: bool = True              # scan undocumented TLS-CONNECT (port 89) servers
     scan_concurrency: int = 120
+    max_leases: int = 4              # max simultaneously leased nord exits
 
     @property
     def enabled(self) -> bool:
@@ -123,4 +127,8 @@ def load_settings(config_path: str | Path | None = None) -> Settings:
     # Ensure paths exist
     Path(settings.db_path).parent.mkdir(parents=True, exist_ok=True)
     Path(settings.downloads.dest).mkdir(parents=True, exist_ok=True)
+    if settings.proxy.mode not in ("public", "nord"):
+        raise ValueError(f"proxy.mode must be 'public' or 'nord', got {settings.proxy.mode!r}")
+    if settings.proxy.mode == "nord" and not settings.nord.enabled:
+        raise ValueError("proxy.mode=nord requires nord.user and nord.password (service credentials)")
     return settings

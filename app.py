@@ -31,7 +31,9 @@ def create_app(config_path: str | None = None) -> tuple[Flask, Engine, asyncio.A
     settings = load_settings(config_path)
     store = Store(settings.db_path)
     pool = ProxyPool(store, ban_ttl_s=settings.proxy.ban_ttl_h * 3600,
-                     fail_ban_after=settings.proxy.fail_ban_after)
+                     fail_ban_after=settings.proxy.fail_ban_after,
+                     mode=settings.proxy.mode,
+                     nord_max_leases=settings.nord.max_leases)
 
     loop = asyncio.new_event_loop()
     engine = Engine(settings, store, pool)

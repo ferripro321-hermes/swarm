@@ -20,11 +20,16 @@ class Lease:
 
 class ProxyPool:
     def __init__(self, store, ban_ttl_s: float = 6 * 3600.0,
-                 fail_ban_after: int = 3, bench_fn=None):
+                 fail_ban_after: int = 3, bench_fn=None,
+                 mode: str = "public", nord_max_leases: int = 4):
         self.store = store
         self.ban_ttl_s = ban_ttl_s
         self.fail_ban_after = fail_ban_after
         self.bench_fn = bench_fn          # async (url) -> BenchResult (refresh loop)
+        # mode: "public" leases nothing from Nord URLs; "nord" leases ONLY
+        # Nord URLs. Either/or, no mixing.
+        self.mode = mode
+        self.nord_max_leases = max(1, nord_max_leases)
         self._ready: dict[str, float] = {}       # url -> score (available now)
         self._leased: set[str] = set()
         self._cooldown: dict[str, float] = {}    # url -> unban time
@@ -32,12 +37,25 @@ class ProxyPool:
 
     # ── startup ────────────────────────────────────────────────────────
     def prime_from_store(self) -> None:
-        """Load ready + cooldown proxies from the store (engine boot)."""
+        """Load ready + cooldown proxies from the store (engine boot).
+
+        Only rows matching proxy.mode are loaded for leasing — rows from the
+        other mode stay in the DB untouched so a config switch doesn't need a
+        re-bench.
+        """
+        from swarm.proxies.nord import is_nord_url
         now = time.time()
+
+        def keep(url: str) -> bool:
+            return is_nord_url(url) if self.mode == "nord" else not is_nord_url(url)
+
         for p in self.store.get_proxies_by_state("ready"):
-            self._ready[p["url"]] = p.get("score") or 0.0
+            if keep(p["url"]):
+                self._ready[p["url"]] = p.get("score") or 0.0
         for p in self.store.get_proxies_by_state("leased"):
             # orphaned leases (crash) → back to ready
+            if not keep(p["url"]):
+                continue
             self._ready[p["url"]] = p.get("score") or 0.0
             self.store.set_proxy_state(p["url"], "ready")
         for p in self.store.get_proxies_by_state("cooldown"):
@@ -49,14 +67,29 @@ class ProxyPool:
                 self.store.set_proxy_state(p["url"], "ready")
 
     # ── leasing ────────────────────────────────────────────────────────
+    def _mode_ok(self, url: str) -> bool:
+        from swarm.proxies.nord import is_nord_url
+        if self.mode == "nord":
+            return is_nord_url(url)
+        return not is_nord_url(url)
+
+    def _nord_leased_count(self) -> int:
+        from swarm.proxies.nord import is_nord_url
+        return sum(1 for u in self._leased if is_nord_url(u))
+
     async def lease(self, exclude: set[str] | None = None) -> Lease | None:
         async with self._lock:
             self._expire_cooldowns()
+            nord_in_pool = self.mode == "nord"
+            if nord_in_pool and self._nord_leased_count() >= self.nord_max_leases:
+                return None            # curated-set cap: never over-lease Nord
             best_url, best_score = None, -1.0
             for url, score in self._ready.items():
                 if exclude and url in exclude:
                     continue
                 if url in self._leased:
+                    continue
+                if not self._mode_ok(url):
                     continue
                 if score > best_score:
                     best_url, best_score = url, score
@@ -110,7 +143,11 @@ class ProxyPool:
     def add_result(self, url: str, ok: bool, score: float | None,
                    latency_ms: float | None = None,
                    throughput_kbps: float | None = None) -> None:
-        """Called by the refresher after benching a proxy."""
+        """Called by the refresher after benching a proxy.
+
+        Results for the *other* mode's URLs are still recorded (they update
+        grades in SQLite) but are never leased thanks to the mode gate.
+        """
         self.store.upsert_proxy(url)
         if ok and score and score > 0:
             self.store.set_proxy_state(url, "ready", score=score,
@@ -131,11 +168,25 @@ class ProxyPool:
             self._ready.setdefault(url, 0.0)
             self.store.set_proxy_state(url, "ready")
 
-    def stats(self) -> dict[str, int]:
+    def stats(self) -> dict[str, int | str]:
+        from swarm.proxies.nord import is_nord_url
         self._expire_cooldowns()
-        return {
-            "ready": len([u for u in self._ready if u not in self._leased]),
-            "leased": len(self._leased),
+
+        def keep(url: str) -> bool:
+            return is_nord_url(url) if self.mode == "nord" else not is_nord_url(url)
+
+        dead = [p for p in self.store.get_proxies_by_state("dead", limit=5000) if keep(p["url"])]
+        out: dict[str, int | str] = {
+            "mode": self.mode,
+            "ready": len([u for u in self._ready
+                          if u not in self._leased and self._mode_ok(u)]),
+            "leased": len([u for u in self._leased if self._mode_ok(u)]),
             "cooldown": len(self._cooldown),
-            "dead": len(self.store.get_proxies_by_state("dead", limit=5000)),
+            "dead": len(dead),
+            "nord_leases_cap": self.nord_max_leases if self.mode == "nord" else 0,
         }
+        # raw store counters (mode-filtered), kept for the dashboard/import flow
+        for state in ("new", "testing"):
+            rows = self.store.get_proxies_by_state(state, limit=5000)
+            out[state] = len([p for p in rows if keep(p["url"])])
+        return out

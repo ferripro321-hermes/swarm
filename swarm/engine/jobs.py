@@ -180,34 +180,40 @@ class Engine:
 
         cfg = self.settings.proxy
         nord = None
-        if getattr(self.settings, "nord", None) and self.settings.nord.enabled:
+        nord_cfg = getattr(self.settings, "nord", None)
+        if nord_cfg and nord_cfg.enabled and cfg.mode == "nord":
             from swarm.proxies.nord import NordProvider
-            nord = NordProvider(self.settings.nord.user, self.settings.nord.password,
-                                countries=self.settings.nord.countries,
-                                port89=self.settings.nord.port89,
-                                scan_concurrency=self.settings.nord.scan_concurrency)
-            self.store.add_event("proxy", "nord provider enabled (socks.nordhold.net + port89 scan)")
+            nord = NordProvider(nord_cfg.user, nord_cfg.password,
+                                countries=nord_cfg.countries,
+                                port89=nord_cfg.port89,
+                                scan_concurrency=nord_cfg.scan_concurrency)
+            self.store.add_event("proxy", f"nord provider enabled (mode=nord, max_leases={nord_cfg.max_leases})")
 
         while not self._stopped:
             try:
-                # Nord endpoints first: alive-verified by their own probes,
-                # so dead rows can be re-queued (public lists never get this)
-                if nord is not None:
-                    try:
-                        nord_urls = await nord.endpoints()
-                        for u in nord_urls:
-                            row = self.store.get_proxy(u)
-                            if row is None:
-                                self.store.upsert_proxy(u, protocol=("socks5" if u.startswith("socks5") else "https"),
-                                                        source="nord")
-                                self.store.set_proxy_state(u, "new")
-                            elif row["state"] == "dead":
-                                self.store.set_proxy_state(u, "new")
-                        self.store.add_event("proxy", f"nord endpoints alive: {len(nord_urls)}")
-                    except Exception as e:
-                        self.store.add_event("error", f"nord provider: {e}")
-
-                entries = await fetch_all_sources(cfg.sources)
+                # Public lists only in public mode — nord mode leases curated
+                # Nord endpoints exclusively (either/or, no mixing).
+                if cfg.mode == "public":
+                    entries = await fetch_all_sources(cfg.sources)
+                else:
+                    entries = []
+                    # Nord endpoints: alive-verified by their own probes, so a
+                    # row marked dead (rate-limit blip) gets re-queued here
+                    if nord is not None:
+                        try:
+                            nord_urls = await nord.endpoints()
+                            for u in nord_urls:
+                                row = self.store.get_proxy(u)
+                                if row is None:
+                                    self.store.upsert_proxy(
+                                        u, protocol=("socks5" if u.startswith("socks5") else "https"),
+                                        source="nord")
+                                if (row is None or row["state"] == "dead") \
+                                        and u not in self.pool._leased:
+                                    self.store.set_proxy_state(u, "new")
+                            self.store.add_event("proxy", f"nord endpoints alive: {len(nord_urls)}")
+                        except Exception as e:
+                            self.store.add_event("error", f"nord provider: {e}")
                 fresh = [e for e in entries if self.store.get_proxy(e.url) is None]
                 for e in entries:   # remember all (even old) for dedup
                     if e.url not in {p["url"] for p in self.store.list_proxies(limit=10) if False}:
@@ -252,19 +258,28 @@ class Engine:
                 self.store.add_event("proxy", f"bench pass done; pool stats: {self.pool.stats()}")
             except Exception as e:
                 self.store.add_event("error", f"refresh loop: {e}")
-            await asyncio.sleep(cfg.refresh_min * 60)
+            # cadence: nord pool dry → rescan almost immediately (fresh exits
+            # are the recovery path); nord healthy → 5 min; public → 30 min
+            if cfg.mode == "nord":
+                stats = self.pool.stats()
+                wait = 90.0 if stats.get("ready", 0) == 0 else 300.0
+            else:
+                wait = cfg.refresh_min * 60
+            await asyncio.sleep(wait)
 
     async def bench_new_now(self) -> None:
         """One-shot bench pass over 'new' proxies (manual trigger)."""
         from swarm.proxies.bench import bench_proxy
+        from swarm.proxies.nord import is_nord_url
         cfg = self.settings.proxy
         pending = self.store.get_proxies_by_state("new", limit=5000)
+        if cfg.mode == "nord":
+            pending = [p for p in pending if is_nord_url(p["url"])]
+        else:
+            pending = [p for p in pending if not is_nord_url(p["url"])]
 
-        def _is_nord(u: str) -> bool:
-            return "nordvpn.com:" in u or "nordhold.net:" in u
-
-        nord_bench = [p["url"] for p in pending if _is_nord(p["url"])]
-        public_bench = [p["url"] for p in pending if not _is_nord(p["url"])]
+        nord_bench = [p["url"] for p in pending if is_nord_url(p["url"])]
+        public_bench = [p["url"] for p in pending if not is_nord_url(p["url"])]
         # see refresh_proxies_forever: nord auth rate-limits per source IP
         for urls, conc in ((public_bench, 150), (nord_bench, 4)):
             sem = asyncio.Semaphore(conc)

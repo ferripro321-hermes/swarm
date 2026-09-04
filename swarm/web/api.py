@@ -72,7 +72,7 @@ def make_api_blueprint(engine, store: Store, loop) -> Blueprint:
             proxies = store.get_proxies_by_state(state, limit=limit)
         else:
             proxies = store.list_proxies(limit=limit)
-        return jsonify(proxies=proxies, stats=store.proxy_stats())
+        return jsonify(proxies=proxies, stats=engine.pool.stats())
 
     @bp.post("/proxies/import")
     def import_proxies():
@@ -97,7 +97,7 @@ def make_api_blueprint(engine, store: Store, loop) -> Blueprint:
 
     @bp.get("/proxies/stats")
     def proxy_stats():
-        return jsonify(store.proxy_stats())
+        return jsonify(engine.pool.stats())
 
     # ── events ────────────────────────────────────────────────────────
     @bp.get("/events")
@@ -127,7 +127,7 @@ def make_api_blueprint(engine, store: Store, loop) -> Blueprint:
                                           "bytes_done": f["bytes_done"],
                                           "size": f["size"]}
                                          for f in j["files"]]} for j in store.list_jobs(limit=20)],
-                    "proxies": store.proxy_stats(),
+                    "proxies": engine.pool.stats(),
                 }
                 yield f"event: state\ndata: {json.dumps(payload, default=str)}\n\n"
                 _t.sleep(1.0)
@@ -140,6 +140,6 @@ def make_api_blueprint(engine, store: Store, loop) -> Blueprint:
     # ── ui ────────────────────────────────────────────────────────────
     @bp.get("/health")
     def health():
-        return jsonify(ok=True, stats=store.proxy_stats())
+        return jsonify(ok=True, stats=engine.pool.stats())
 
     return bp

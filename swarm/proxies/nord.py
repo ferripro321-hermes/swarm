@@ -28,6 +28,11 @@ import urllib.request
 NORD_API = "https://api.nordvpn.com/v1/servers?limit=0&groups%5B%5D=legacy-standard"
 
 
+def is_nord_url(url: str) -> bool:
+    """Nord endpoint URLs (nordhold SOCKS5 / nordvpn.com TLS-CONNECT)."""
+    return "nordvpn.com:" in url or "nordhold.net:" in url
+
+
 class NordProvider:
     def __init__(self, user: str, password: str, *,
                  countries: list[str] | None = None,

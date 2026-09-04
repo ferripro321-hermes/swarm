@@ -56,9 +56,11 @@ Downloads real bytes and reports rotation stats — the acceptance test for the 
 | proxy.bench | min_throughput_kbps | 250 | below this → dead |
 | proxy.bench | speed_url | mega.nz/secureboot.js | MEGA edge asset used to measure throughput |
 | downloads | dest | data/downloads | default download root |
+| proxy | **mode** | public | `public` (lists only) **or** `nord` (NordVPN only) — never mixed |
 | nord | user / password | — | NordVPN **service credentials** (Nord dashboard → manual setup) |
 | nord | countries | ES FR DE BE NL SE | countries to scan for proxy-enabled servers |
 | nord | port89 | true | probe undocumented TLS-CONNECT proxy (port 89) |
+| nord | max_leases | 4 | max Nord exits leased at the same time |
 | nord | scan_concurrency | 120 | parallel auth probes during the port-89 scan |
 
 Env overrides: `SWARM_<SECTION>_<KEY>` (e.g. `SWARM_SERVER_PORT=8080`).

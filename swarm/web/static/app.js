@@ -81,7 +81,12 @@ $("job-form").addEventListener("submit", async (e) => {
 async function loadProxies() {
   try {
     const { proxies, stats } = await api("/api/proxies?limit=200");
+    const modeBadge = stats.mode === "nord"
+      ? `<span style="color:var(--accent-bright)">● nord</span>` +
+        (stats.nord_leases_cap ? ` <span style="color:var(--muted-fg)">(${stats.nord_leases_cap} max)</span>` : "")
+      : `<span style="color:var(--muted-fg)">● public</span>`;
     $("proxy-summary").innerHTML =
+      `${modeBadge} · ` +
       `<span style="color:var(--green)">● ${stats.ready}</span> ready · ` +
       `<span style="color:var(--accent-bright)">● ${stats.leased}</span> busy · ` +
       `<span style="color:var(--orange)">● ${stats.cooldown}</span> cooldown · ` +
@@ -91,8 +96,10 @@ async function loadProxies() {
       `<div class="stat-chip ${k}"><div class="num">${stats[k] ?? 0}</div><div class="lbl">${k}</div></div>`
     ).join("");
 
+    const isNordUrl = u => u.includes("nordvpn.com:") || u.includes("nordhold.net:");
     const rows = proxies
       .filter(p => ["ready", "leased", "cooldown"].includes(p.state))
+      .filter(p => stats.mode === "nord" ? isNordUrl(p.url) : !isNordUrl(p.url))
       .sort((a, b) => (b.score ?? -1) - (a.score ?? -1))
       .slice(0, 25)
       .map(p => `<tr>
