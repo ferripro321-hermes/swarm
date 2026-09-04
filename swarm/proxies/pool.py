@@ -137,5 +137,5 @@ class ProxyPool:
             "ready": len([u for u in self._ready if u not in self._leased]),
             "leased": len(self._leased),
             "cooldown": len(self._cooldown),
-            "dead": len(self.store.get_proxies_by_state("dead")),
+            "dead": len(self.store.get_proxies_by_state("dead", limit=5000)),
         }

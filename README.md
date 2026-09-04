@@ -54,6 +54,7 @@ Downloads real bytes and reports rotation stats — the acceptance test for the 
 | proxy | sources | monosans + ProxyScrape | raw list URLs |
 | proxy | refresh_min | 30 | pool refresh cadence |
 | proxy.bench | min_throughput_kbps | 250 | below this → dead |
+| proxy.bench | speed_url | mega.nz/secureboot.js | MEGA edge asset used to measure throughput |
 | downloads | dest | data/downloads | default download root |
 
 Env overrides: `SWARM_<SECTION>_<KEY>` (e.g. `SWARM_SERVER_PORT=8080`).

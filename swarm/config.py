@@ -31,6 +31,7 @@ class BenchConfig:
     speed_timeout_s: float = 10.0
     min_throughput_kbps: float = 250.0
     rebench_after_s: float = 3600.0
+    speed_url: str = "https://mega.nz/secureboot.js"
 
 
 @dataclass

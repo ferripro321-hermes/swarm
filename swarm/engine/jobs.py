@@ -187,7 +187,11 @@ class Engine:
                     if e.url not in {p["url"] for p in self.store.list_proxies(limit=10) if False}:
                         self.store.upsert_proxy(e.url, protocol=e.protocol, source=e.source)
                 self.store.add_event("proxy", f"sources fetched: {len(entries)} entries, {len(fresh)} new")
-                # bench new ones (bounded by bench of one at a time here; batch elsewhere)
+                # bench: unseen URLs + anything still sitting in 'new' (e.g. a
+                # previous pass was interrupted, or states were reset by hand)
+                bench_urls = [e.url for e in fresh]
+                bench_urls += [p["url"] for p in self.store.get_proxies_by_state("new", limit=5000)]
+                bench_urls = list(dict.fromkeys(bench_urls))   # dedupe, keep order
                 sem = asyncio.Semaphore(150)
 
                 async def bench_one(url: str):
@@ -199,11 +203,12 @@ class Engine:
                             speed_cap_mb=cfg.bench.speed_cap_mb,
                             speed_timeout_s=cfg.bench.speed_timeout_s,
                             min_throughput_kbps=cfg.bench.min_throughput_kbps,
+                            speed_url=cfg.bench.speed_url,
                         )
                         self.pool.add_result(url, r.ok, grade_from(r),
                                              r.latency_ms, r.throughput_kbps)
 
-                await asyncio.gather(*(bench_one(e.url) for e in fresh))
+                await asyncio.gather(*(bench_one(u) for u in bench_urls))
                 self.store.add_event("proxy", f"bench pass done; pool stats: {self.pool.stats()}")
             except Exception as e:
                 self.store.add_event("error", f"refresh loop: {e}")
@@ -225,6 +230,7 @@ class Engine:
                     speed_cap_mb=cfg.bench.speed_cap_mb,
                     speed_timeout_s=cfg.bench.speed_timeout_s,
                     min_throughput_kbps=cfg.bench.min_throughput_kbps,
+                    speed_url=cfg.bench.speed_url,
                 )
                 self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms, r.throughput_kbps)
 

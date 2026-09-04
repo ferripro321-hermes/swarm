@@ -2,9 +2,15 @@
 
 Stages (each eliminates garbage cheaply before spending bandwidth):
   1. TCP/TLS reachability through the proxy (fast timeout)
-  2. MEGA API reachability — proves the proxy can actually reach g.api.mega.co.nz
-     (most public proxies pass generic checks but die here)
-  3. Throughput: stream a bounded payload from a MEGA CDN host
+  2. MEGA API reachability — a GET to g.api.mega.co.nz through the proxy proves
+     it can actually reach MEGA (most public proxies pass generic checks but die here)
+  3. Throughput: stream MEGA-owned bytes from the static MEGA edge asset
+     (mega.nz/secureboot.js — stable name, no key, no transfer quota).
+
+Why not a gfsN.storage.mega.nz host for stage 3? MEGA assigns per-download CDN
+hosts dynamically via the API (and old names rot to NXDOMAIN); the static edge
+serves real MEGA infrastructure bytes without burning any quota-metered call.
+The actual download path still resolves its CDN URL fresh from the API per file.
 
 Grading produces score 0-100; pool decisions consume it.
 """
@@ -19,7 +25,8 @@ import aiohttp
 from aiohttp_socks import ProxyConnector
 
 MEGA_API_PROBE = "https://g.api.mega.co.nz/cs?id=0"   # returns [-4]-ish JSON or error; status 200 is enough
-SPEED_URL = "https://gfs301.storage.mega.nz/"          # CDN edge; Range-limited GET
+SPEED_URL = "https://mega.nz/secureboot.js"            # static MEGA edge asset (~194 KB), no key/quota
+SPEED_ASSET_APPROX_BYTES = 190 * 1024                  # asset size hint, for deciding single vs multi fill
 
 
 @dataclass
@@ -32,37 +39,64 @@ class BenchResult:
     error: str | None = None
 
 
-async def _stage_connect(session_get, proxy: str, timeout_s: float) -> float | None:
-    """Cheap HEAD-ish request; returns latency_ms or raises."""
+async def _stage_connect(session_get, timeout_s: float) -> float | None:
+    """Cheap GET to the MEGA API root through the (connector-bound) proxy; returns latency_ms or raises."""
     start = time.monotonic()
     async with session_get(
-        "https://g.api.mega.co.nz/", proxy=proxy,
+        "https://g.api.mega.co.nz/",
         timeout=aiohttp.ClientTimeout(total=timeout_s),
     ) as resp:
         await resp.read()
     return (time.monotonic() - start) * 1000.0
 
 
-async def _stage_speed(session_get, proxy: str, cap_bytes: int, timeout_s: float) -> float:
-    """Stream up to cap_bytes; return kbps (bytes/sec / 1024 * 1000... actual KB/s)."""
+async def _stage_speed(session_get, cap_bytes: int, timeout_s: float,
+                       speed_url: str = SPEED_URL) -> float:
+    """Stream up to cap_bytes of MEGA edge bytes; return KB/s.
+
+    The asset is ~194 KB, so caps larger than the asset are filled with
+    successive cache-busted requests. Timing covers the whole stage (including
+    per-request handshakes), i.e. real achievable throughput through the proxy.
+    A cap not reached within timeout_s is fine — we grade what arrived; only
+    less than one chunk (64 KB) total counts as unusable.
+    """
     start = time.monotonic()
     total = 0
-    timeout = aiohttp.ClientTimeout(total=timeout_s)
-    async with session_get(SPEED_URL, proxy=proxy, timeout=timeout,
-                           headers={"Range": f"bytes=0-{cap_bytes - 1}"}) as resp:
-        async for chunk in resp.content.iter_chunked(64 * 1024):
-            total += len(chunk)
-            if total >= cap_bytes:
-                break
+    buster = int(time.time())
+    deadline = start + timeout_s
+    while total < cap_bytes:
+        remaining_s = deadline - time.monotonic()
+        if remaining_s <= 0:
+            break
+        url = f"{speed_url}?_swarm_bench={buster}"
+        buster += 1
+        try:
+            async with session_get(
+                url, timeout=aiohttp.ClientTimeout(total=remaining_s),
+            ) as resp:
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    take = min(len(chunk), cap_bytes - total)
+                    total += take
+                    if total >= cap_bytes:
+                        break
+        except (asyncio.TimeoutError, TimeoutError):
+            break   # ran out of time — grade what arrived
+        if total >= cap_bytes:
+            break
     elapsed = time.monotonic() - start
     if elapsed <= 0 or total < 64 * 1024:      # less than one chunk -> unusable
-        raise IOError(f"insufficient data ({total}B)")
+        raise IOError(f"insufficient data ({total}B in {elapsed:.1f}s)")
     return (total / 1024.0) / elapsed          # KB/s
 
 
 def grade(latency_ms: float | None, throughput_kbps: float | None,
           min_throughput_kbps: float = 250.0) -> float:
-    """Score 0-100. 60% throughput (vs 5 MB/s reference), 40% latency (vs 3000ms)."""
+    """Score 0-100. 60% throughput (vs 5 MB/s reference), 40% latency (vs 3000ms).
+
+    Strict on purpose: no throughput measurement -> 0 (an unmeasured proxy is
+    not a proven one). Stage-3 failures therefore kill, which is correct given
+    the speed target is plain MEGA edge bytes.
+    """
     if throughput_kbps is None or throughput_kbps < min_throughput_kbps:
         return 0.0
     speed_norm = min(1.0, throughput_kbps / 5000.0)
@@ -73,7 +107,8 @@ def grade(latency_ms: float | None, throughput_kbps: float | None,
 async def bench_proxy(url: str, connect_timeout_s: float = 5.0,
                       mega_timeout_s: float = 8.0, speed_cap_mb: float = 3.0,
                       speed_timeout_s: float = 10.0,
-                      min_throughput_kbps: float = 250.0) -> BenchResult:
+                      min_throughput_kbps: float = 250.0,
+                      speed_url: str = SPEED_URL) -> BenchResult:
     try:
         connector = ProxyConnector.from_url(url)
     except Exception as e:
@@ -81,20 +116,21 @@ async def bench_proxy(url: str, connect_timeout_s: float = 5.0,
 
     timeout = aiohttp.ClientTimeout(total=connect_timeout_s + mega_timeout_s + speed_timeout_s + 5)
     try:
+        # Proxying is bound via the connector only — never also pass proxy= per
+        # request (aiohttp forbids mixing a proxy connector with proxy=).
         async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
             get = session.get
 
             # stage 1+2 combined: a GET to the MEGA API through the proxy
             try:
-                latency = await _stage_connect(get, url, connect_timeout_s + mega_timeout_s)
+                latency = await _stage_connect(get, connect_timeout_s + mega_timeout_s)
             except Exception as e:
                 return BenchResult(url, ok=False, stage_failed="mega", error=str(e)[:120])
 
-            # stage 3: throughput (best-effort; failure downgrades but proxies with
-            # good latency still get graded by latency alone if speed endpoint fails)
-            kbps: float | None = None
+            # stage 3: throughput through the proxy against MEGA edge bytes
             try:
-                kbps = await _stage_speed(get, url, int(speed_cap_mb * 1024 * 1024), speed_timeout_s)
+                kbps = await _stage_speed(get, int(speed_cap_mb * 1024 * 1024),
+                                          speed_timeout_s, speed_url)
             except Exception:
                 kbps = None
 
