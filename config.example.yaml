@@ -31,5 +31,6 @@ nord:
   password: ""
   countries: [ES, FR, DE, BE, NL, SE]
   port89: true            # probe port 89 on proxy-flagged servers
-  scan_concurrency: 120
+  scan_concurrency: 40    # keep low: each scan fires one proxy-auth per server
+  scan_interval_s: 3600   # full-scan cache; auth-probes trigger Nord rate-limits
   max_leases: 4           # max simultaneously leased nord exits

@@ -275,7 +275,8 @@ class Engine:
             nord = NordProvider(nord_cfg.user, nord_cfg.password,
                                 countries=nord_cfg.countries,
                                 port89=nord_cfg.port89,
-                                scan_concurrency=nord_cfg.scan_concurrency)
+                                scan_concurrency=nord_cfg.scan_concurrency,
+                                scan_interval_s=nord_cfg.scan_interval_s)
             self.store.add_event("proxy", f"nord provider enabled (mode=nord, max_leases={nord_cfg.max_leases})")
 
         while not self._stopped:
@@ -346,6 +347,14 @@ class Engine:
                             if throttled:
                                 self._nord_retry_at[url] = (
                                     time.time() + self.pool.throttle_skip_minutes(url) * 60)
+                            elif not r.ok:
+                                # non-throttle nord failure (dead/timed-out):
+                                # still gate the re-probe — a pass that re-queues
+                                # ~50 endpoints every 90 s keeps the auth rate
+                                # high enough to re-trigger Nord's 407 window
+                                self._nord_retry_at[url] = max(
+                                    self._nord_retry_at.get(url, 0.0),
+                                    time.time() + 600.0)
 
                     await asyncio.gather(*(one(u) for u in urls))
 

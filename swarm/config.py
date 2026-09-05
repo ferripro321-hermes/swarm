@@ -62,6 +62,7 @@ class NordConfig:
     countries: list[str] = field(default_factory=lambda: ["ES", "FR", "DE", "BE", "NL", "SE"])
     port89: bool = True              # scan undocumented TLS-CONNECT (port 89) servers
     scan_concurrency: int = 120
+    scan_interval_s: int = 3600      # full port-89 scan cache (auth-probes are rate-limit sensitive)
     max_leases: int = 4              # max simultaneously leased nord exits
 
     @property
