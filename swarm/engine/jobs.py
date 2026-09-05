@@ -445,17 +445,33 @@ async def _http_cdn_get(url, headers=None, proxy=None):
 
     Uses the per-proxy session cache: one warm TLS-CONNECT tunnel per proxy
     (Nord rate-limits per-connection auth → per-chunk fresh tunnels 407).
-    The session stays open across chunks; the response is released on exit
-    and the keepalive connection returns to the cached session's pool.
+    The session stays open across chunks; the response is released on context
+    exit and the keepalive connection returns to the cached session's pool.
     """
-    import aiohttp
-
     from swarm.proxies.tls_connect import cached_session
 
     session, per_req_proxy = await cached_session(proxy, timeout_s=60)
     if per_req_proxy:
-        return session.get(url, headers=headers, proxy=per_req_proxy)
-    return session.get(url, headers=headers)
+        resp = await session.get(url, headers=headers, proxy=per_req_proxy)
+    else:
+        resp = await session.get(url, headers=headers)
+
+    class _Resp:
+        def __init__(self, resp):
+            self._resp = resp
+            self.status = resp.status
+            self.content = resp.content
+
+        async def read(self, n=-1):
+            return await self._resp.read()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            await self._resp.release()   # keepalive conn returns to the cached session
+
+    return _Resp(resp)
 
 
 def _decompose(link: str) -> tuple[str, str, bytes]:
