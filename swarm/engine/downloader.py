@@ -96,7 +96,9 @@ class ChunkWorker:
         resp = await self.cdn_get(url, headers=headers, proxy=proxy)
         if resp.status == 509:
             raise QuotaSignal()
-        if resp.status != 200:
+        # MEGA CDN answers Range requests with 206 Partial Content (200 only
+        # for full-body GETs) — both are success; anything else is an error.
+        if resp.status not in (200, 206):
             raise IOError(f"CDN HTTP {resp.status}")
         data = await asyncio.wait_for(resp.read(), timeout=self.chunk_timeout_s)
         if len(data) != length:
