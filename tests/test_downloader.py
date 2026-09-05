@@ -9,6 +9,7 @@ from swarm.providers.mega import (
     base64url_encode,
     chunk_table,
     ctr_crypt,
+    fold_key,
     prepare_key,
     ParsedLink,
 )
@@ -19,7 +20,7 @@ from swarm.engine.downloader import ChunkWorker, DownloadResult
 # ── fixtures ───────────────────────────────────────────────────────────
 
 KEY = bytes(range(32))
-AES_KEY, NONCE, MAC_KEY = prepare_key(KEY)
+AES_KEY, NONCE, EXPECTED_MAC = prepare_key(KEY)   # EXPECTED_MAC = k[24:32]
 
 
 def make_spec(size: int, url="https://gfs1.storage.mega.nz/file/H") -> FileSpec:
@@ -165,3 +166,47 @@ async def test_pool_exhaustion_returns_pending(tmp_path):
                          max_lease_wait_s=0.05)
     result = await worker.run()
     assert result == DownloadResult.PENDING  # job stays resumable, not failed
+
+
+# ── integrity: streaming MAC (megajs) vs expected k[24:32] ─────────────
+
+def test_verify_file_mac_matches_reference(tmp_path):
+    """Engine._verify_file (segmented-CBC optimized) must agree with the
+    auditable block-by-block reference stream_mac() — and catch corruption.
+
+    (Ground truth of the scheme itself: real-download validation, see
+    scripts/debug_mac.py — a synthetic key's k[24:32] is not a MAC of
+    synthetic data, so the reference's output is the oracle here.)
+    """
+    from swarm.engine.jobs import Engine
+    from swarm.providers.mega import stream_mac
+    from swarm.store import Store
+
+    size = 3 * 131072 + 5000   # crosses posNext boundaries 128K,384K + tail
+    plain = bytes((i * 7 + 3) % 256 for i in range(size))
+    # build a CONSISTENT 32B key the way MEGA stores one: content = k[:16] XOR
+    # k[16:32], nonce = k[16:24], mac = k[24:32] — with mac = stream_mac of
+    # the plaintext under (content, nonce)
+    content_key = bytes(range(16))
+    nonce = bytes(range(16, 24))
+    mac = stream_mac(plain, content_key, nonce)
+    second = nonce + mac
+    first = bytes(a ^ b for a, b in zip(content_key, second))   # so fold == content
+    key = first + second
+    assert prepare_key(key) == (content_key, nonce, mac)
+    spec = FileSpec(handle="H", key=key, size=size, name="f.bin", relpath="f.bin")
+    store = Store(str(tmp_path / "db.sqlite"))
+    engine = Engine.__new__(Engine)   # only _verify_file is exercised
+    out = tmp_path / "f.bin"
+    out.write_bytes(plain)
+
+    # optimized verify agrees with the reference scheme on the same bytes
+    ok, err = engine._verify_file(spec, out)
+    assert ok, f"optimized verify disagrees with reference stream_mac: {err}"
+
+    # corruption must be caught: flip one byte
+    bad = bytearray(plain)
+    bad[200000] ^= 0xFF
+    out.write_bytes(bytes(bad))
+    ok, err = engine._verify_file(spec, out)
+    assert not ok and "MAC mismatch" in (err or "")

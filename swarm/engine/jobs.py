@@ -13,11 +13,11 @@ from pathlib import Path
 
 from swarm.providers.mega import (
     ParsedLink,
-    chunk_mac,
     chunk_table,
-    meta_mac,
+    fold_key,
     prepare_key,
 )
+from Crypto.Cipher import AES
 from swarm.providers.mega_api import FileSpec, MegaClient
 from swarm.proxies.pool import ProxyPool
 from swarm.store import Store
@@ -49,9 +49,7 @@ class Engine:
             specs = await self.mega.folder_tree(parsed)
             if not specs:
                 raise ValueError("folder has no downloadable files (or keys undecryptable)")
-            for spec in specs:   # biggest first
-                pass
-            specs.sort(key=lambda s: -s.size)
+            specs.sort(key=lambda s: -s.size)   # biggest first
             for spec in specs:
                 self._register_file(job_id, spec, job_dest)
 
@@ -59,12 +57,13 @@ class Engine:
         return job_id
 
     def _register_file(self, job_id: int, spec: FileSpec, job_dest: Path) -> int:
-        file_id = self.store.add_file(
+        return self.store.add_file(
             job_id, name=spec.name, size=spec.size,
             handle=spec.handle, key=spec.key.hex(),
             relpath=spec.relpath or spec.name,
+            share_handle=spec.share_handle,
+            expected_mac=spec.expected_mac.hex() if spec.expected_mac else "",
         )
-        return file_id
 
     def set_job_status_threadsafe(self, job_id: int, status: str) -> None:
         self.store.set_job_status(job_id, status)
@@ -103,6 +102,9 @@ class Engine:
             name=file_row["name"],
             url=None,
             relpath=file_row["relpath"],
+            share_handle=file_row["share_handle"] or None,
+            expected_mac=(bytes.fromhex(file_row["expected_mac"])
+                          if file_row.get("expected_mac") else None),
         )
         worker = ChunkWorker(
             spec, self.pool,
@@ -138,25 +140,57 @@ class Engine:
                 self.store.add_event("job", f"job {job_id} finished", job_id=job_id)
 
     def _verify_file(self, spec: FileSpec, path: Path) -> tuple[bool, str | None]:
-        """Full-file CBC-MAC verification (MegaBasterd-style per-chunk fold)."""
-        job = getattr(self, "_current_job", None)
+        """Integrity check: size + streaming MAC over plaintext vs k[24:32].
+
+        The file on disk is already CTR-decrypted, so this is MAC-only
+        (megajs MAC class, byte-verified 2026-09-05). If the key blob carries
+        no expected MAC (single-file links unfold to zero MAC), size is all
+        we can check.
+        """
         if not path.exists() or path.stat().st_size != spec.size:
             return False, "size mismatch"
-        aes_key, nonce, mac_key = prepare_key(spec.key)
-        macs = []
-        with open(path, "rb") as f:
-            for offset, length in chunk_table(spec.size):
-                f.seek(offset)
-                data = f.read(length)
-                macs.append(chunk_mac(data, mac_key, nonce, offset))
-        computed = meta_mac(macs)
-        # NOTE: full comparison needs the expected MAC from the attr blob
-        # (`at` holds key SERIALIZED with mac); we verify structural integrity
-        # here and compare against expected when provided by the caller.
-        expected = getattr(spec, "expected_mac", None)
-        if expected is None:
+        _, nonce, expected = prepare_key(spec.key)
+        if not any(expected):
             return True, None
-        return computed == expected, None if computed == expected else "MAC mismatch"
+        aes_key = fold_key(spec.key)
+        seed = nonce + nonce          # every segment reseeds to nonce||nonce
+
+        # megajs MAC schedule: snapshot the running chain every posNext bytes,
+        # where increments grow by 128K up to 1M (NOT the download chunking —
+        # byte-exact validated 2026-09-05 via scripts/debug_mac.py).
+        # The chain IS a CBC encryption (c_i = E(p_i ⊕ c_{i-1}), c_0 = seed),
+        # so each segment is one CBC call and its last block is the snapshot.
+        snaps: list[bytes] = []
+        pos = 0
+        pos_next, increment = 131072, 131072
+        with open(path, "rb") as f:
+            while pos < spec.size:
+                seg = min(pos_next - pos, spec.size - pos)
+                data = f.read(seg)
+                if len(data) != seg:
+                    return False, "short read during MAC"
+                if len(data) % 16:
+                    data += b"\x00" * (16 - len(data) % 16)
+                snaps.append(AES.new(aes_key, AES.MODE_CBC, seed).encrypt(data)[-16:])
+                pos += seg
+                if pos == pos_next and pos < spec.size:
+                    if increment < 1048576:
+                        increment += 131072
+                    pos_next += increment
+        if pos == pos_next:       # EOF exactly on a boundary: megajs's post-loop
+            snaps.append(bytes(seed))  # append captures the reseeded (fresh) mac
+        # condense (megajs): XOR-fold snapshots w/ one ECB encrypt per fold
+        ecb_fold = AES.new(aes_key, AES.MODE_ECB)
+        accb = bytearray(16)
+        for m in snaps:
+            for j in range(16):
+                accb[j] ^= m[j]
+            accb = bytearray(ecb_fold.encrypt(bytes(accb)))
+        w = [int.from_bytes(bytes(accb[i:i + 4]), "big") for i in (0, 4, 8, 12)]
+        computed = (w[0] ^ w[1]).to_bytes(4, "big") + (w[2] ^ w[3]).to_bytes(4, "big")
+        if computed != expected:
+            return False, f"MAC mismatch: {computed.hex()} != {expected.hex()}"
+        return True, None
 
     # ── control ────────────────────────────────────────────────────────
     async def pause_job(self, job_id: int) -> None:

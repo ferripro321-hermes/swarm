@@ -16,10 +16,8 @@ from pathlib import Path
 
 from swarm.providers.mega import (
     ParsedLink,
-    chunk_mac,
     chunk_table,
     ctr_crypt,
-    meta_mac,
     prepare_key,
 )
 from swarm.providers.mega_api import FileSpec
@@ -106,15 +104,24 @@ class ChunkWorker:
         return data
 
     async def _ensure_url(self, lease) -> str:
-        """Return a CDN URL, re-fetching through the current proxy if needed."""
+        """Return a CDN URL, re-fetching through the current proxy if needed.
+
+        Folder files need the share handle as API context (&n=<share>):
+        body {"a":"g","g":1,"ssl":2,"n":<file handle>}, URL &n=<share>.
+        Single public file links use the p: form instead.
+        """
         if self.spec.url is not None:
             return self.spec.url
         if self.mega_client is None:
             raise IOError("no url and no mega client to fetch one")
-        spec = await self.mega_client.file_info(
-            ParsedLink("file", self.spec.handle, self.spec.key), proxy=lease.proxy
-        )
-        self.spec.url = spec.url
+        if self.spec.share_handle:
+            url, size = await self.mega_client.file_url(
+                self.spec.handle, self.spec.share_handle, proxy=lease.proxy)
+        else:
+            spec = await self.mega_client.file_info(
+                ParsedLink("file", self.spec.handle, self.spec.key), proxy=lease.proxy)
+            url = spec.url
+        self.spec.url = url
         return self.spec.url  # type: ignore[return-value]
 
     async def run(self) -> DownloadResult:

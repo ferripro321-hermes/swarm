@@ -11,8 +11,7 @@ from swarm.providers.mega import (
     parse_link,
     ctr_crypt,
     decrypt_attr,
-    chunk_mac,
-    meta_mac,
+    stream_mac,
     ParsedLink,
 )
 
@@ -100,20 +99,21 @@ def test_chunk_table_exact_sizes():
 # ── crypto ─────────────────────────────────────────────────────────────
 
 def test_prepare_key_splits_32byte_key():
+    # megajs scheme (byte-verified against a real download, 2026-09-05):
+    # content key = k[:16] XOR k[16:32]; nonce = k[16:24];
+    # expected file MAC = k[24:32] (stored in the key blob — no mac key exists)
     key = bytes(range(32))
-    aes_key, nonce, mac_key = prepare_key(key)
-    assert aes_key == key[:16]
+    aes_key, nonce, mac = prepare_key(key)
+    assert aes_key == bytes(a ^ b for a, b in zip(key[:16], key[16:32]))
     assert nonce == key[16:24]
-    # MegaBasterd/mega.py derivation: mac key = k[24:32] + k[16:20] + k[20:24]
-    assert mac_key == key[24:32] + key[16:20] + key[20:24]
+    assert mac == key[24:32]
 
 
-def test_prepare_key_macauc():
-    # Full derivation check: maca = k[24:32] || k[16:20] || k[20:24]
+def test_prepare_key_fold_is_real():
+    # the fold must actually XOR the halves (the old split returned k[:16] raw)
     key = bytes(range(32))
-    _, nonce, mac_key = prepare_key(key)
-    assert nonce == key[16:24]
-    assert mac_key == bytes(range(24, 32)) + bytes(range(16, 20)) + bytes(range(20, 24))
+    aes_key, _, _ = prepare_key(key)
+    assert aes_key != key[:16]
 
 
 def test_ctr_crypt_symmetric():
@@ -145,18 +145,45 @@ def test_decrypt_attr_roundtrip():
     pad = (16 - body % 16) % 16
     plain = b"MEGA" + payload + b"\x00" * pad
     assert len(plain) % 16 == 0
-    enc = AES.new(aes_key, AES.MODE_ECB).encrypt(plain)
+    # attrs are AES-CBC with a ZERO IV (ECB never decrypts — sweep-verified)
+    enc = AES.new(aes_key, AES.MODE_CBC, b"\x00" * 16).encrypt(plain)
     assert decrypt_attr(enc, aes_key) == {"n": "test song.mp3", "c": "0,0,0"}
 
 
-def test_chunk_mac_and_meta_mac_known_file():
-    """Full-file MAC for a synthetic file must match a manual computation."""
+def test_stream_mac_matches_segmented_cbc_derivation():
+    """Naive reference stream_mac == independent segmented-CBC derivation.
+
+    The chain c_i = E(p_i ⊕ c_{i-1}) with c_0 = seed IS a CBC encryption
+    seeded nonce||nonce; snapshots follow megajs's posNext schedule (128K
+    steps growing to 1M). Ground truth for the whole scheme was established
+    against a REAL download (0.8 MB MP4, computed == k[24:32]) — see
+    scripts/debug_mac.py + references/mega-crypto.md.
+    """
+    from Crypto.Cipher import AES
+
+    from swarm.providers.mega import stream_mac
     key = bytes(range(32))
-    aes_key, nonce, mac_key = prepare_key(key)
-    data = bytes(200000)  # two chunks: 128K + rest
-    table = chunk_table(len(data))
-    assert len(table) == 2
-    macs = [chunk_mac(data[off:off + ln], mac_key, nonce, off) for off, ln in table]
-    final = meta_mac(macs)
-    # manual per mega.py: for each chunk mac = ECB(mac_key) xor-fold; then meta = fold of chunk macs
-    assert isinstance(final, bytes) and len(final) == 8
+    aes_key, nonce, _ = prepare_key(key)
+    data = bytes((i * 11) % 256 for i in range(200000))
+
+    seed = nonce + nonce
+    ec = AES.new(aes_key, AES.MODE_ECB)
+    snaps, pos, nxt, inc = [], 0, 131072, 131072
+    while pos < len(data):
+        seg = data[pos:min(nxt, len(data))]
+        if len(seg) % 16:
+            seg += b"\x00" * (16 - len(seg) % 16)
+        snaps.append(AES.new(aes_key, AES.MODE_CBC, seed).encrypt(seg)[-16:])
+        pos += len(seg)
+        if pos == nxt and pos < len(data):
+            if inc < 1048576:
+                inc += 131072
+            nxt += inc
+    if pos == nxt:          # EOF exactly on a boundary → trailing reseeded seed
+        snaps.append(seed)
+    acc = bytearray(16)
+    for m in snaps:
+        acc = bytearray(ec.encrypt(bytes(a ^ b for a, b in zip(acc, m))))
+    w = [int.from_bytes(bytes(acc[i:i + 4]), "big") for i in (0, 4, 8, 12)]
+    manual = (w[0] ^ w[1]).to_bytes(4, "big") + (w[2] ^ w[3]).to_bytes(4, "big")
+    assert stream_mac(data, aes_key, nonce) == manual

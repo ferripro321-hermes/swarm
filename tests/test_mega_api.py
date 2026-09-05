@@ -88,13 +88,15 @@ async def test_api_error_generic():
 
 @pytest.mark.asyncio
 async def test_folder_tree_resolves_paths():
+    from swarm.providers.mega import fold_key
     link = parse_link("https://mega.nz/folder/FH#"+_b64key16())
-    # f response: nodes 'h' with parent 'p', file attrs encrypted, shares carry the share key
-    node_key = bytes(range(32))           # the real node file key
-    node_aes = node_key[:16]
+    # f response: nodes 'h' with parent 'p', file attrs encrypted with the
+    # FOLDED node key (as in real shares), node k ECB-encrypted with share key
+    node_key = bytes(range(32))           # the real node file key (compkey)
+    node_attr_key = fold_key(node_key)
     share_key = _b64key16()
-    f1_attr = _attr_blob("song one.mp3", node_aes)
-    f2_attr = _attr_blob("sub/song two.mp3", node_aes)
+    f1_attr = _attr_blob("song one.mp3", node_attr_key)
+    f2_attr = _attr_blob("sub/song two.mp3", node_attr_key)
     session = FakeSession([
         FakeResponse(_cs_response({
             "f": [
@@ -112,6 +114,9 @@ async def test_folder_tree_resolves_paths():
     assert files[0].name == "song one.mp3"
     assert files[0].size == 100
     assert files[0].key == node_key
+    # share handle + expected MAC must ride along (URL refetch / verification)
+    assert files[0].share_handle == "FH"
+    assert files[0].expected_mac == node_key[24:32]
 
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -133,7 +138,8 @@ def _attr_blob(name: str, aes_key: bytes) -> str:
     body = len(payload) + 4
     pad = (16 - body % 16) % 16
     plain = b"MEGA" + payload + b"\x00" * pad
-    return base64url_encode(AES.new(aes_key, AES.MODE_ECB).encrypt(plain))
+    # real attrs: AES-CBC zero-IV (ECB never decrypts live shares)
+    return base64url_encode(AES.new(aes_key, AES.MODE_CBC, b"\x00" * 16).encrypt(plain))
 
 
 def _enc_node_key(node_key: bytes) -> str:

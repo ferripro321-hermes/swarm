@@ -30,6 +30,8 @@ CREATE TABLE IF NOT EXISTS files (
     status TEXT NOT NULL DEFAULT 'pending',  -- pending|downloading|verifying|done|failed|corrupt|cancelled
     bytes_done INTEGER NOT NULL DEFAULT 0,
     chunks_state TEXT NOT NULL DEFAULT '',   -- '1' per finished chunk
+    share_handle TEXT,                       -- folder share handle (URL refetch on rotation)
+    expected_mac TEXT,                       -- hex k[24:32]; '' = no MAC in key (single links)
     error TEXT,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
@@ -75,6 +77,12 @@ class Store:
         self._local = threading.local()
         with self._conn() as c:
             c.executescript(_SCHEMA)
+            # lightweight migrations: files.share_handle / files.expected_mac
+            existing = {r[1] for r in c.execute("PRAGMA table_info(files)").fetchall()}
+            if "share_handle" not in existing:
+                c.execute("ALTER TABLE files ADD COLUMN share_handle TEXT")
+            if "expected_mac" not in existing:
+                c.execute("ALTER TABLE files ADD COLUMN expected_mac TEXT NOT NULL DEFAULT ''")
 
     def _conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -134,13 +142,16 @@ class Store:
             )
 
     # ── files ─────────────────────────────────────────────────────────
-    def add_file(self, job_id: int, name: str, size: int, handle: str, key: str, relpath: str) -> int:
+    def add_file(self, job_id: int, name: str, size: int, handle: str, key: str, relpath: str,
+                 share_handle: str | None = None, expected_mac: str = "") -> int:
         now = time.time()
         with self._conn() as c:
             cur = c.execute(
-                """INSERT OR IGNORE INTO files (job_id, name, relpath, size, handle, key, created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?)""",
-                (job_id, name, relpath, size, handle, key, now, now),
+                """INSERT OR IGNORE INTO files
+                   (job_id, name, relpath, size, handle, key, share_handle, expected_mac,
+                    created_at, updated_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, name, relpath, size, handle, key, share_handle, expected_mac, now, now),
             )
             if cur.lastrowid is not None and cur.lastrowid > 0:
                 return int(cur.lastrowid)

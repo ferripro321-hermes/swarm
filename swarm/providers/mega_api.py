@@ -28,11 +28,13 @@ from swarm.providers.mega import (
 @dataclass
 class FileSpec:
     handle: str
-    key: bytes            # 32-byte file key
+    key: bytes            # 32-byte file key (compkey)
     size: int
     name: str
     url: str | None = None  # filled by file_info; folder nodes resolve lazily
     relpath: str = ""
+    share_handle: str | None = None   # folder share handle (folder links only)
+    expected_mac: bytes | None = None  # file MAC = compkey[24:32]
 
 
 class MegaClient:
@@ -122,65 +124,131 @@ class MegaClient:
                               handle=link.handle, proxy=proxy)
         if isinstance(resp, int):
             self._raise(resp)
-        aes_key, _, _ = prepare_key(link.key_bytes)
-        attr = decrypt_attr(base64url_decode(resp["at"]), aes_key)
+        key = link.key_bytes
+        # single-file links carry a 16-byte folded content key; store as
+        # key||zeros so prepare_key() folds back to the same 16 bytes and
+        # derives zero nonce + zero (absent) MAC
+        if len(key) == 16:
+            key = key + b"\x00" * 16
+        content_key, nonce, mac8 = prepare_key(key)
+        attr_key = key[:16]   # attrs decrypt with k[:16] (pre-fold), CBC zero-IV
+        attr = decrypt_attr(base64url_decode(resp["at"]), attr_key)
         return FileSpec(
             handle=link.handle,
-            key=link.key_bytes,
+            key=key,
             size=int(resp["s"]),
             name=attr.get("n", link.handle),
             url=resp.get("g"),
             relpath=attr.get("n", link.handle),
+            expected_mac=mac8,
         )
 
     # ── folder links ───────────────────────────────────────────────────
     async def folder_tree(self, link: ParsedLink, proxy: str | None = None) -> list[FileSpec]:
         """Walk a public folder and return every file node with names/paths.
 
-        Node decryption: the share 'ok' entry carries the folder master key
-        encrypted with the link key; each node's 'k' field is
-        '<handle>:<encrypted_node_key>' encrypted with that share key.
+        Verified against live shares (megajs/go-mega semantics):
+          - share key (if 'ok' entries exist): AES-ECB(link_key, ok.k)[:16]
+          - else the root folder node's own k IS share-encrypted with the link key
+          - each file node's k blob: AES-ECB-decrypt with the share key OR the
+            raw link key (shares differ) -> 32-byte compkey
+          - content/CTR key = compkey[:16] XOR compkey[16:32] (the fold)
+          - attrs decrypt CBC zero-IV with the FOLDED key
+          - expected file MAC = compkey[24:32]
         """
         resp = await self.api({"a": "f", "c": 1, "r": 1}, handle=link.handle, proxy=proxy)
         if isinstance(resp, int):
             self._raise(resp)
+        if not isinstance(resp, dict):
+            raise ValueError(f"unexpected folder response type: {type(resp).__name__}")
 
         nodes = {n["h"]: n for n in resp.get("f", []) if isinstance(n, dict)}
 
-        # Resolve the share key: 'ok' nodes hold AES-ECB(link_key) encrypted 16B key
-        share_keys: dict[str, bytes] = {}
+        # Candidate key-decryptors, in order: 'ok' share keys, root-node key,
+        # raw link key (some shares encrypt file k-entries directly with it).
+        cands: list[bytes] = []
         for ok in resp.get("ok", []):
             try:
-                dec = self._ecb_decrypt(base64url_decode(ok["k"]), link.key_bytes)
-                share_keys[ok["h"]] = dec[:16]
+                cands.append(self._ecb_decrypt(base64url_decode(ok["k"]), link.key_bytes)[:16])
             except Exception:
                 continue
+        for n in resp.get("f", []):
+            if n.get("t") == 1 and n.get("k"):
+                try:
+                    cands.append(self._ecb_decrypt(base64url_decode(n["k"]), link.key_bytes)[:16])
+                except Exception:
+                    continue
+        cands.append(link.key_bytes)
+        # dedupe, keep order
+        cands = list(dict.fromkeys(cands))
 
+        from swarm.providers.mega import fold_key
         out: list[FileSpec] = []
+        tree_root = next((n["h"] for n in resp.get("f", [])
+                          if n.get("t") == 1 and n.get("p") == link.handle), link.handle)
         for node in resp.get("f", []):
             if node.get("t") != 0:      # 0=file, 1=folder, 2=root
                 continue
-            handle = node["h"]
-            key = self._node_key(node, share_keys)
-            if key is None:
+            if not node.get("k") or not node.get("a"):
                 continue
-            aes_key, _, _ = prepare_key(key)
+            spec = self._decrypt_file_node(node, cands, nodes, tree_root)
+            if spec is not None:
+                out.append(spec)
+        return out
+
+    def _decrypt_file_node(self, node: dict, key_cands: list[bytes],
+                           nodes: dict[str, dict], tree_root: str) -> FileSpec | None:
+        """Try every candidate key on this node's k blob; attr-decrypt decides."""
+        from swarm.providers.mega import fold_key
+        attr_blob = base64url_decode(node["a"])
+        for kc in key_cands:
             try:
-                attr = decrypt_attr(base64url_decode(node["a"]), aes_key)
+                enc = base64url_decode(node["k"].split(":", 1)[1])
+                compkey = self._ecb_decrypt(enc, kc)
+                if len(compkey) != 32 or not any(compkey):
+                    continue
+                content = fold_key(compkey)
+                attr = decrypt_attr(attr_blob, content)
+                name = attr.get("n")
+                if not name:
+                    continue
+                return FileSpec(
+                    handle=node["h"],
+                    key=compkey,
+                    size=int(node.get("s", 0)),
+                    name=name,
+                    relpath=self._relpath(node, nodes, name),
+                    share_handle=tree_root,
+                    expected_mac=compkey[24:32],
+                )
             except Exception:
                 continue
-            name = attr.get("n")
-            if not name:
-                continue
-            relpath = self._relpath(node, nodes, name)
-            out.append(FileSpec(
-                handle=handle,
-                key=key,
-                size=int(node.get("s", 0)),
-                name=name,
-                relpath=relpath,
-            ))
-        return out
+        return None
+
+    async def file_url(self, handle: str, share_handle: str | None = None,
+                       proxy: str | None = None) -> tuple[str, int]:
+        """CDN download URL for a file.
+
+        Folder files: body {"a":"g","g":1,"ssl":2,"n":<file handle>} with the
+        share handle as the API's &n= query context (verified). Single links
+        use {"a":"g","p":<handle>}.
+        Returns (url, size).
+        """
+        if share_handle:
+            body = {"a": "g", "g": 1, "ssl": 2, "n": handle}
+            ctx = share_handle
+        else:
+            body = {"a": "g", "p": handle, "ssl": 2}
+            ctx = handle
+        resp = await self.api(body, handle=ctx, proxy=proxy)
+        if isinstance(resp, int):
+            self._raise(resp)
+        if not isinstance(resp, dict):
+            raise MegaError(-1, f"unexpected a:g response: {str(resp)[:120]}")
+        url = resp.get("g")
+        if not url:
+            raise MegaError(-1, f"no CDN url in a:g response: {str(resp)[:120]}")
+        return str(url), int(resp.get("s", 0))
 
     @staticmethod
     def _ecb_decrypt(data: bytes, key16: bytes) -> bytes:

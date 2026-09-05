@@ -132,25 +132,29 @@ def chunk_table(file_size: int) -> list[tuple[int, int]]:
 
 # ── crypto ─────────────────────────────────────────────────────────────
 
-def prepare_key(key32: bytes) -> tuple[bytes, bytes, bytes]:
-    """Split a 32-byte file key into (aes_key16, nonce8, mac_key16).
+def fold_key(key32: bytes) -> bytes:
+    """Content key = k[:16] XOR k[16:32] (MEGA file-key fold)."""
+    return bytes(a ^ b for a, b in zip(key32[:16], key32[16:32]))
 
-    Derivation per mega.py / MegaBasterd: aes key = k[0:16];
-    nonce = k[16:24]; mac key = k[24:32] + k[16:20] + k[20:24].
+
+def prepare_key(key32: bytes) -> tuple[bytes, bytes, bytes]:
+    """Split a 32-byte MEGA file key into (content_key16, nonce8, mac8).
+
+    Per megajs/go-mega (verified against a real download):
+      - content/CTR key = k[:16] XOR k[16:32]
+      - CTR nonce       = k[16:24]
+      - expected MAC    = k[24:32]  (the file MAC is stored in the key blob)
     """
     if len(key32) != 32:
         raise ValueError("file key must be 32 bytes")
-    aes_key = key32[:16]
-    nonce = key32[16:24]
-    mac_key = key32[24:32] + key32[16:20] + key32[20:24]
-    return aes_key, nonce, mac_key
+    return fold_key(key32), key32[16:24], key32[24:32]
 
 
 def decrypt_attr(attr: bytes, aes_key: bytes) -> dict:
-    """Decrypt an `at` attribute blob (AES-ECB, 'MEGA' + JSON + pad)."""
+    """Decrypt an `at` attribute blob (AES-CBC zero-IV, 'MEGA' + JSON + pad)."""
     if len(attr) % 16:
         attr = attr[: len(attr) - (len(attr) % 16)]
-    dec = AES.new(aes_key, AES.MODE_ECB).decrypt(attr)
+    dec = AES.new(aes_key, AES.MODE_CBC, b"\x00" * 16).decrypt(attr)
     if not dec.startswith(b"MEGA"):
         # some nodes lack the prefix; try raw JSON parse
         try:
@@ -172,20 +176,37 @@ def ctr_crypt(data: bytes, aes_key: bytes, nonce: bytes, offset: int) -> bytes:
     return _ctr_cipher(aes_key, nonce, offset).encrypt(data)
 
 
-def chunk_mac(data: bytes, mac_key: bytes, nonce: bytes, offset: int) -> bytes:
-    """CBC-MAC over one chunk, seeded with nonce||offset/16 (per MEGA)."""
-    mac_cipher = AES.new(mac_key, AES.MODE_ECB)
-    mac = nonce + (offset // 16 // 1048576).to_bytes(8, "big")
-    for i in range(0, len(data), 16):
-        block = data[i:i + 16].ljust(16, b"\x00")
-        mac = mac_cipher.encrypt(bytes(a ^ b for a, b in zip(mac, block)))
-    return mac
+def stream_mac(plain: bytes, aes_key: bytes, nonce: bytes) -> bytes:
+    """Reference streaming file MAC (megajs MAC class, block-by-block).
 
-
-def meta_mac(chunk_macs: list[bytes]) -> bytes:
-    """XOR-fold chunk MACs (8 bytes each) into the final file MAC."""
-    out = bytearray(8)
-    for cm in chunk_macs:
-        for i in range(8):
-            out[i] ^= cm[i] ^ cm[i + 8]
-    return bytes(out)
+    Byte-verified ground truth against a real download (2026-09-05):
+    running CBC-ENCRYPT chain seeded nonce||nonce, snapshot + reseed at the
+    megajs posNext schedule (increments of 128K growing up to 1M — NOT the
+    download chunk table), trailing segment always captured, then XOR-fold
+    condense. Engine._verify_file computes the same value with per-segment
+    CBC optimization; this naive form stays as the auditable reference.
+    """
+    ec = AES.new(aes_key, AES.MODE_ECB)
+    mac = bytearray(nonce + nonce)
+    macs: list[bytes] = []
+    pos, pos_next, increment = 0, 131072, 131072
+    for i in range(0, len(plain), 16):
+        block = plain[i:i + 16].ljust(16, b"\x00")
+        for j in range(16):
+            mac[j] ^= block[j]
+        mac = bytearray(ec.encrypt(bytes(mac)))
+        pos += 16
+        if pos >= pos_next:
+            macs.append(bytes(mac))
+            mac = bytearray(nonce + nonce)
+            if increment < 1048576:
+                increment += 131072
+            pos_next += increment
+    macs.append(bytes(mac))
+    acc = bytearray(16)
+    for m in macs:
+        for j in range(16):
+            acc[j] ^= m[j]
+        acc = bytearray(ec.encrypt(bytes(acc)))
+    w = [int.from_bytes(bytes(acc[i:i + 4]), "big") for i in (0, 4, 8, 12)]
+    return (w[0] ^ w[1]).to_bytes(4, "big") + (w[2] ^ w[3]).to_bytes(4, "big")
