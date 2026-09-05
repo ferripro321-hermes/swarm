@@ -35,6 +35,7 @@ class Engine:
         self._stopped = False
         self._refresh_task: asyncio.Task | None = None
         self._nord_retry_at: dict[str, float] = {}   # url -> earliest re-bench time (throttle backoff)
+        self._sched: dict[int, asyncio.Task] = {}    # job_id -> active schedule task
 
     # ── job creation ───────────────────────────────────────────────────
     async def create_job(self, link: str, dest: str | None = None) -> int:
@@ -78,41 +79,57 @@ class Engine:
             return
         self.store.set_job_status(job_id, "running")
         self.store.add_event("job", f"job {job_id} started", job_id=job_id)
-
-        pending = [f for f in job["files"] if f["status"] in ("pending", "downloading", "failed")]
-        # simple scheduler: up to max_parallel_files files at once
-        running: list[asyncio.Task] = []
-        for f in pending:
-            while len([t for t in running if not t.done()]) >= self.settings.engine.max_parallel_files:
-                await asyncio.sleep(0.2)
-            t = asyncio.create_task(self._run_file(job_id, f))
-            self._tasks.add(t)
-            t.add_done_callback(self._tasks.discard)
-            running.append(t)
-        # long-job self-heal: throttle cooldowns (90 s) leave files 'failed'
-        # with the pool intact — re-sweep failed files periodically until the
-        # job drains, instead of stranding them until a manual resume.
-        if any(f["status"] == "failed" for f in job["files"]):
-            self._schedule_retry_sweep(job_id)
-
-    def _schedule_retry_sweep(self, job_id: int, delay: float = 120.0) -> None:
-        async def _sweep():
-            await asyncio.sleep(delay)
-            if self._stopped:
-                return
-            job = self.store.get_job(job_id)
-            if job is None or job["status"] in ("done", "cancelled"):
-                return
-            retry = [f for f in job["files"] if f["status"] == "failed"]
-            if not retry:
-                return
-            for f in retry:
-                self.store.set_file_status(f["id"], "pending")
-            self.store.add_event("job", f"job {job_id}: re-queued {len(retry)} failed files (throttle retry)")
-            await self.start_job(job_id)   # re-arms the sweep if still failing
-        t = asyncio.create_task(_sweep())
+        # schedule-and-return: the API must not block until the job drains
+        prev = self._sched.get(job_id)
+        if prev is not None and not prev.done():
+            return          # a pass is already active — never double-schedule
+        t = asyncio.create_task(self._schedule_job(job_id))
+        self._sched[job_id] = t
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
+
+    async def _schedule_job(self, job_id: int) -> None:
+        """One pass over pending files, bounded by max_parallel_files.
+
+        After the pass, any failed files are re-queued and another pass runs
+        (throttle cooldowns recover in 90 s) until the job drains.
+        """
+        try:
+            await self._schedule_job_inner(job_id)
+        finally:
+            self._sched.pop(job_id, None)
+
+    async def _schedule_job_inner(self, job_id: int) -> None:
+        """One pass over pending files, bounded by max_parallel_files.
+
+        After the pass, any failed files are re-queued and another pass runs
+        (throttle cooldowns recover in 90 s) until the job drains.
+        """
+        job = self.store.get_job(job_id)
+        if job is None or self._stopped:
+            return
+        pending = [f for f in job["files"] if f["status"] in ("pending", "downloading", "failed")]
+        sem = asyncio.Semaphore(self.settings.engine.max_parallel_files)
+
+        async def run_one(f: dict) -> None:
+            async with sem:
+                await self._run_file(job_id, f)
+
+        if pending:
+            await asyncio.gather(*(run_one(f) for f in pending))
+        job = self.store.get_job(job_id)
+        if job is None or self._stopped:
+            return
+        retry = [f for f in job["files"] if f["status"] in ("failed", "pending")]
+        if retry:
+            for f in retry:
+                if f["status"] == "failed":
+                    self.store.set_file_status(f["id"], "pending")
+            self.store.set_job_status(job_id, "running")
+            self.store.add_event("job", f"job {job_id}: re-queued {len(retry)} files for another pass")
+            await asyncio.sleep(90)   # let throttle cooldowns expire
+            if not self._stopped:
+                await self._schedule_job_inner(job_id)
 
     async def _run_file(self, job_id: int, file_row: dict) -> None:
         file_id = file_row["id"]
