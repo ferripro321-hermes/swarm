@@ -73,18 +73,13 @@ class MegaClient:
             url += f"&n={handle}"
         body = json.dumps(payload if isinstance(payload, list) else [payload])
         if proxy and proxy.startswith(("socks5://", "socks4://")):
-            from swarm.proxies.tls_connect import proxied_session
-            session, _ = proxied_session(proxy, timeout_s=self._timeout_s)
-            try:
-                return await self._api_via(session, url, body)
-            finally:
-                await session.close()
+            from swarm.proxies.tls_connect import cached_session
+            session, _ = await cached_session(proxy, timeout_s=self._timeout_s)
+            return await self._api_via(session, url, body)
         if proxy:
-            session = await self._with_tls_connector(proxy)
-            try:
-                return await self._api_via(session, url, body, proxy=proxy)
-            finally:
-                await session.close()
+            from swarm.proxies.tls_connect import cached_session
+            session, per_req = await cached_session(proxy, timeout_s=self._timeout_s)
+            return await self._api_via(session, url, body, proxy=per_req)
         http = await self._http()
         return await self._api_via(http, url, body)
 

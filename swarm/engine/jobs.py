@@ -34,6 +34,7 @@ class Engine:
         self._tasks: set[asyncio.Task] = set()
         self._stopped = False
         self._refresh_task: asyncio.Task | None = None
+        self._nord_retry_at: dict[str, float] = {}   # url -> earliest re-bench time (throttle backoff)
 
     # ── job creation ───────────────────────────────────────────────────
     async def create_job(self, link: str, dest: str | None = None) -> int:
@@ -88,6 +89,30 @@ class Engine:
             self._tasks.add(t)
             t.add_done_callback(self._tasks.discard)
             running.append(t)
+        # long-job self-heal: throttle cooldowns (90 s) leave files 'failed'
+        # with the pool intact — re-sweep failed files periodically until the
+        # job drains, instead of stranding them until a manual resume.
+        if any(f["status"] == "failed" for f in job["files"]):
+            self._schedule_retry_sweep(job_id)
+
+    def _schedule_retry_sweep(self, job_id: int, delay: float = 120.0) -> None:
+        async def _sweep():
+            await asyncio.sleep(delay)
+            if self._stopped:
+                return
+            job = self.store.get_job(job_id)
+            if job is None or job["status"] in ("done", "cancelled"):
+                return
+            retry = [f for f in job["files"] if f["status"] == "failed"]
+            if not retry:
+                return
+            for f in retry:
+                self.store.set_file_status(f["id"], "pending")
+            self.store.add_event("job", f"job {job_id}: re-queued {len(retry)} failed files (throttle retry)")
+            await self.start_job(job_id)   # re-arms the sweep if still failing
+        t = asyncio.create_task(_sweep())
+        self._tasks.add(t)
+        t.add_done_callback(self._tasks.discard)
 
     async def _run_file(self, job_id: int, file_row: dict) -> None:
         file_id = file_row["id"]
@@ -236,13 +261,18 @@ class Engine:
                     if nord is not None:
                         try:
                             nord_urls = await nord.endpoints()
+                            now = time.time()
                             for u in nord_urls:
                                 row = self.store.get_proxy(u)
                                 if row is None:
                                     self.store.upsert_proxy(
                                         u, protocol=("socks5" if u.startswith("socks5") else "https"),
                                         source="nord")
-                                if (row is None or row["state"] == "dead") \
+                                # re-queue dead rows for re-verification, but
+                                # respect throttle backoff (auth rate-limit):
+                                # hammering auth re-triggers the 407 flood
+                                due = self._nord_retry_at.get(u, 0.0)
+                                if (row is None or (row["state"] == "dead" and now >= due)) \
                                         and u not in self.pool._leased:
                                     self.store.set_proxy_state(u, "new")
                             self.store.add_event("proxy", f"nord endpoints alive: {len(nord_urls)}")
@@ -279,8 +309,13 @@ class Engine:
                                 min_throughput_kbps=cfg.bench.min_throughput_kbps,
                                 speed_url=cfg.bench.speed_url,
                             )
+                            throttled = getattr(r, "stage_failed", None) == "throttle"
                             self.pool.add_result(url, r.ok, grade_from(r),
-                                                 r.latency_ms, r.throughput_kbps)
+                                                 r.latency_ms, r.throughput_kbps,
+                                                 throttled=throttled)
+                            if throttled:
+                                self._nord_retry_at[url] = (
+                                    time.time() + self.pool.throttle_skip_minutes(url) * 60)
 
                     await asyncio.gather(*(one(u) for u in urls))
 
@@ -329,7 +364,12 @@ class Engine:
                         min_throughput_kbps=cfg.bench.min_throughput_kbps,
                         speed_url=cfg.bench.speed_url,
                     )
-                    self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms, r.throughput_kbps)
+                    throttled = getattr(r, "stage_failed", None) == "throttle"
+                    self.pool.add_result(url, r.ok, grade_from(r), r.latency_ms,
+                                         r.throughput_kbps, throttled=throttled)
+                    if throttled:
+                        self._nord_retry_at[url] = (
+                            time.time() + self.pool.throttle_skip_minutes(url) * 60)
 
             await asyncio.gather(*(one(u) for u in urls))
         self.store.add_event("proxy", f"manual bench pass: {self.pool.stats()}")
@@ -349,6 +389,11 @@ class Engine:
         self._stopped = True
         for tasks in self._tasks:
             tasks.cancel()
+        from swarm.proxies.tls_connect import close_cached_sessions
+        try:
+            await close_cached_sessions()
+        except Exception:
+            pass
         await self.mega.close()
 
 
@@ -359,35 +404,21 @@ def grade_from(result) -> float:
 
 
 async def _http_cdn_get(url, headers=None, proxy=None):
-    """Real CDN GET through a leased proxy — all dialects (socks5/http/https-TLS)."""
+    """Real CDN GET through a leased proxy — all dialects (socks5/http/https-TLS).
+
+    Uses the per-proxy session cache: one warm TLS-CONNECT tunnel per proxy
+    (Nord rate-limits per-connection auth → per-chunk fresh tunnels 407).
+    The session stays open across chunks; the response is released on exit
+    and the keepalive connection returns to the cached session's pool.
+    """
     import aiohttp
 
-    from swarm.proxies.tls_connect import proxied_session
+    from swarm.proxies.tls_connect import cached_session
 
-    session, per_req_proxy = proxied_session(proxy, timeout_s=60)
-    try:
-        if per_req_proxy:
-            resp = await session.get(url, headers=headers, proxy=per_req_proxy)
-        else:
-            resp = await session.get(url, headers=headers)
-        # wrap resp so __aexit__ closes the session too
-        class _Resp:
-            def __init__(self, resp, session):
-                self._resp = resp
-                self._session = session
-                self.status = resp.status
-                self.content = resp.content
-            async def read(self, n=-1):
-                return await self._resp.read()
-            async def __aenter__(self):
-                return self
-            async def __aexit__(self, *exc):
-                await self._resp.release()
-                await self._session.close()
-        return _Resp(resp, session)
-    except Exception:
-        await session.close()
-        raise
+    session, per_req_proxy = await cached_session(proxy, timeout_s=60)
+    if per_req_proxy:
+        return session.get(url, headers=headers, proxy=per_req_proxy)
+    return session.get(url, headers=headers)
 
 
 def _decompose(link: str) -> tuple[str, str, bytes]:

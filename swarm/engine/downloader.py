@@ -148,8 +148,12 @@ class ChunkWorker:
                         self.pool.release(current, "quota")
                         current = None
                         continue
-                    except Exception:
-                        self.pool.release(current, "fail")
+                    except Exception as e:
+                        outcome = "throttle" if is_throttle_error(e) else "fail"
+                        if outcome == "throttle":
+                            from swarm.proxies.tls_connect import drop_cached_session
+                            await drop_cached_session(current.proxy)
+                        self.pool.release(current, outcome)
                         current = None
                         continue
 
@@ -169,8 +173,19 @@ class ChunkWorker:
                     current = None
                     url = None
                     continue
-                except (asyncio.TimeoutError, IOError, OSError):
-                    self.pool.release(current, "fail")
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    # Nord rate-limits proxy AUTH per source IP (407/502/503):
+                    # that's a temporary throttle, not a dead proxy — drop the
+                    # (possibly poisoned) tunnel and give the exit a short
+                    # cooldown instead of burning fail strikes.
+                    if is_throttle_error(e):
+                        from swarm.proxies.tls_connect import drop_cached_session
+                        await drop_cached_session(current.proxy)
+                        self.pool.release(current, "throttle")
+                    else:
+                        self.pool.release(current, "fail")
                     current = None
                     url = None
                     continue
@@ -184,3 +199,25 @@ class ChunkWorker:
 
 class QuotaSignal(Exception):
     """Raised by the fetch layer on HTTP 509 from the CDN."""
+
+
+class ThrottledError(Exception):
+    """Proxy auth/connect throttled (Nord 407/502/503, 429) — not a dead proxy.
+
+    The proxy stays graded; it just needs a short cooldown before more auth
+    attempts. The worker releases the lease with outcome "throttle".
+    """
+
+    @classmethod
+    def from_exc(cls, e: Exception) -> "ThrottledError":
+        status = getattr(e, "status", None)
+        return cls(f"proxy throttled (HTTP {status or 'err'})")
+
+
+def is_throttle_error(e: Exception) -> bool:
+    """True when an exception looks like proxy throttling, not a hard fail."""
+    status = getattr(e, "status", None)
+    if status in (407, 502, 503, 429):
+        return True
+    text = str(e)[:200].lower()
+    return ("407" in text and "authentication" in text) or "429" in text or "502" in text

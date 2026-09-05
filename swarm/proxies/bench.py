@@ -24,6 +24,7 @@ from dataclasses import dataclass
 import aiohttp
 
 from swarm.proxies.tls_connect import proxied_session
+from swarm.engine.downloader import is_throttle_error
 
 MEGA_API_PROBE = "https://g.api.mega.co.nz/cs?id=0"   # returns [-4]-ish JSON or error; status 200 is enough
 SPEED_URL = "https://mega.nz/secureboot.js"            # static MEGA edge asset (~194 KB), no key/quota
@@ -127,7 +128,10 @@ async def bench_proxy(url: str, connect_timeout_s: float = 5.0,
             try:
                 latency = await _stage_connect(get, connect_timeout_s + mega_timeout_s)
             except Exception as e:
-                return BenchResult(url, ok=False, stage_failed="mega", error=str(e)[:120])
+                # 407/502/503 = Nord auth throttling (per source IP), not a dead
+                # endpoint — surfaced so the pool keeps the row's previous grade
+                stage = "throttle" if is_throttle_error(e) else "mega"
+                return BenchResult(url, ok=False, stage_failed=stage, error=str(e)[:120])
 
             # stage 3: throughput through the proxy against MEGA edge bytes
             try:

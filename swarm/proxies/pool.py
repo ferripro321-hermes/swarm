@@ -21,10 +21,12 @@ class Lease:
 class ProxyPool:
     def __init__(self, store, ban_ttl_s: float = 6 * 3600.0,
                  fail_ban_after: int = 3, bench_fn=None,
-                 mode: str = "public", nord_max_leases: int = 4):
+                 mode: str = "public", nord_max_leases: int = 4,
+                 throttle_cooldown_s: float = 90.0):
         self.store = store
         self.ban_ttl_s = ban_ttl_s
         self.fail_ban_after = fail_ban_after
+        self._throttle_cooldown_s = throttle_cooldown_s
         self.bench_fn = bench_fn          # async (url) -> BenchResult (refresh loop)
         # mode: "public" leases nothing from Nord URLs; "nord" leases ONLY
         # Nord URLs. Either/or, no mixing.
@@ -33,6 +35,7 @@ class ProxyPool:
         self._ready: dict[str, float] = {}       # url -> score (available now)
         self._leased: set[str] = set()
         self._cooldown: dict[str, float] = {}    # url -> unban time
+        self._throttle_strikes: dict[str, int] = {}   # url -> consecutive throttle passes
         self._lock = asyncio.Lock()
 
     # ── startup ────────────────────────────────────────────────────────
@@ -108,7 +111,7 @@ class ProxyPool:
 
     # ── release outcomes ───────────────────────────────────────────────
     def release(self, lease: Lease, outcome: str) -> None:
-        """ok | quota | fail"""
+        """ok | quota | throttle | fail"""
         if lease.released:
             return
         lease.released = True
@@ -118,6 +121,16 @@ class ProxyPool:
         if outcome == "ok":
             self._ready[url] = self._ready.get(url, 0.0)
             self.store.set_proxy_state(url, "ready")
+            return
+
+        if outcome == "throttle":
+            # temporary auth rate-limit (Nord): short cooldown, no fail strike.
+            # The exit keeps its grade and returns to ready afterwards.
+            until = time.time() + self._throttle_cooldown_s
+            self._cooldown[url] = until
+            self._ready.pop(url, None)
+            self.store.mark_proxy_banned(url, until)
+            self.store.add_event("throttle", f"{url} auth-throttled; cooldown 90s")
             return
 
         if outcome == "quota":
@@ -142,22 +155,44 @@ class ProxyPool:
     # ── benchmarking integration ───────────────────────────────────────
     def add_result(self, url: str, ok: bool, score: float | None,
                    latency_ms: float | None = None,
-                   throughput_kbps: float | None = None) -> None:
+                   throughput_kbps: float | None = None,
+                   throttled: bool = False) -> None:
         """Called by the refresher after benching a proxy.
 
         Results for the *other* mode's URLs are still recorded (they update
         grades in SQLite) but are never leased thanks to the mode gate.
+        A throttle result (Nord auth rate-limit) does NOT kill an endpoint:
+        it keeps its previous grade/ready state; consecutive throttle passes
+        back off the re-verification pressure (bench_skip).
         """
         self.store.upsert_proxy(url)
+        if throttled:
+            strikes = self._throttle_strikes.get(url, 0) + 1
+            self._throttle_strikes[url] = strikes
+            self.store.add_event("throttle",
+                                 f"{url} bench throttled x{strikes}; grade kept")
+            # row stays whatever it was — the engine only re-queues throttled
+            # URLs for benching with exponential backoff (bench_skip_minutes)
+            return
+        self._throttle_strikes.pop(url, None)
         if ok and score and score > 0:
             self.store.set_proxy_state(url, "ready", score=score,
                                        latency_ms=latency_ms,
                                        throughput_kbps=throughput_kbps,
                                        last_benched=True)
-            self._ready.setdefault(url, score)
+            self._ready[url] = score
         else:
             self.store.set_proxy_state(url, "dead", last_benched=True)
             self._ready.pop(url, None)
+
+    def throttle_skip_minutes(self, url: str) -> float:
+        """Exponential backoff before re-benching a throttled endpoint.
+
+        2^n minutes, capped at 32: 1, 2, 4, 8, 16, 32, 32... (strike count
+        resets on the first non-throttled result).
+        """
+        strikes = self._throttle_strikes.get(url, 1)
+        return float(min(2 ** max(0, strikes - 1), 32))
 
     # ── introspection ──────────────────────────────────────────────────
     def _expire_cooldowns(self) -> None:
