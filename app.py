@@ -44,8 +44,9 @@ def create_app(config_path: str | None = None) -> tuple[Flask, Engine, asyncio.A
                          name="swarm-engine")
     t.start()
 
-    # start the proxy refresh loop on the engine loop
+    # start the proxy refresh loop on the engine loop + resume stalled jobs
     asyncio.run_coroutine_threadsafe(engine.refresh_proxies_forever(), loop)
+    asyncio.run_coroutine_threadsafe(engine.resume_stalled_jobs(), loop)
 
     app = Flask(__name__, static_folder=None)
 

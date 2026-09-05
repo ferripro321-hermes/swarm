@@ -235,6 +235,18 @@ class Engine:
         return True, None
 
     # ── control ────────────────────────────────────────────────────────
+    async def resume_stalled_jobs(self) -> None:
+        """Boot-time recovery: jobs left 'running' by a crash/restart get
+        their scheduler restarted (chunk state on disk resumes for free)."""
+        for job in self.store.list_jobs(limit=100):
+            if job["status"] == "running":
+                self.store.set_job_status(job["id"], "queued")
+                self.store.add_event("job", f"job {job['id']}: resuming after restart")
+                try:
+                    await self.start_job(job["id"])
+                except Exception as e:
+                    self.store.add_event("error", f"resume job {job['id']}: {e}")
+
     async def pause_job(self, job_id: int) -> None:
         for w in self._workers.get(job_id, []):
             w.cancel()
