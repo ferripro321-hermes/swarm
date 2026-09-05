@@ -138,6 +138,7 @@ class Engine:
         if job is None:
             return
         self.store.set_file_status(file_id, "downloading")
+        done_lens: list[int] = []   # per-chunk byte deltas since this worker started
         spec = FileSpec(
             handle=file_row["handle"],
             key=bytes.fromhex(file_row["key"]),
@@ -149,11 +150,19 @@ class Engine:
             expected_mac=(bytes.fromhex(file_row["expected_mac"])
                           if file_row.get("expected_mac") else None),
         )
+        def _on_chunk_done(state: str) -> None:
+            self.store.update_file_progress(file_id, sum(done_lens), state)
+
+        def _on_progress(delta: int) -> None:
+            done_lens.append(delta)
+
         worker = ChunkWorker(
             spec, self.pool,
             cdn_get=_http_cdn_get,
             dest=job["dest"],
             chunks_state=file_row["chunks_state"],
+            on_progress=_on_progress,
+            on_chunk_done=_on_chunk_done,
             chunk_timeout_s=self.settings.engine.chunk_timeout_s,
             mega_client=self.mega,
         )

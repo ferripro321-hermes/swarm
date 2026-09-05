@@ -49,6 +49,7 @@ class ChunkWorker:
         dest: str | Path,
         chunks_state: str = "",
         on_progress=None,             # callable(bytes_done_delta)
+        on_chunk_done=None,           # callable(chunks_state_str) — persist resume state
         chunk_timeout_s: float = 30.0,
         max_lease_wait_s: float = 120.0,
         mega_client=None,             # for URL re-fetch after rotation (phase 3)
@@ -63,6 +64,7 @@ class ChunkWorker:
         if len(self.chunks_state) < len(self.table):
             self.chunks_state += ["0"] * (len(self.table) - len(self.chunks_state))
         self.on_progress = on_progress
+        self.on_chunk_done = on_chunk_done
         self.chunk_timeout_s = chunk_timeout_s
         self.max_lease_wait_s = max_lease_wait_s
         self.mega_client = mega_client
@@ -170,6 +172,9 @@ class ChunkWorker:
                     self.chunks_state[idx] = "1"
                     if self.on_progress:
                         self.on_progress(length)
+                    if self.on_chunk_done:
+                        # persist chunk state so a crash/restart resumes free
+                        self.on_chunk_done("".join(self.chunks_state))
                 except QuotaSignal:
                     self.pool.release(current, "quota")
                     current = None
