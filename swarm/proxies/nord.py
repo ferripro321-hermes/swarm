@@ -38,8 +38,9 @@ class NordProvider:
                  countries: list[str] | None = None,
                  nordhold_hosts: list[str] | None = None,
                  port89: bool = True,
-                 scan_concurrency: int = 120,
-                 probe_timeout_s: float = 12.0):
+                 scan_concurrency: int = 40,
+                 probe_timeout_s: float = 12.0,
+                 scan_interval_s: float = 1800.0):
         self.user = user
         self.password = password
         self.countries = [c.upper() for c in (countries or ["ES", "FR", "DE", "BE", "NL", "SE"])]
@@ -52,6 +53,13 @@ class NordProvider:
         self.port89 = port89
         self.scan_concurrency = scan_concurrency
         self.probe_timeout_s = probe_timeout_s
+        # Auth-probing ~1.7k servers per refresh pass rate-limits the source IP
+        # (CONNECT auths per IP) and 407s even the good endpoints afterwards.
+        # Full scans are therefore cached: endpoints() returns the last result
+        # until scan_interval_s elapsed (or the caller forces it).
+        self.scan_interval_s = scan_interval_s
+        self._scan_cache: list[str] | None = None
+        self._last_scan_monotonic: float = -1e18
 
     # ── helpers ────────────────────────────────────────────────────────
     @property
@@ -137,14 +145,31 @@ class NordProvider:
         return [u for u in results if u]
 
     # ── merged ────────────────────────────────────────────────────────
-    async def endpoints(self) -> list[str]:
-        """All verified Nord endpoints (socks5 + tls-connect), deduped."""
+    async def endpoints(self, force: bool = False) -> list[str]:
+        """All verified Nord endpoints (socks5 + tls-connect), deduped.
+
+        Cached for scan_interval_s: a full port-89 scan fires one proxy-auth
+        handshake per candidate server (~1.7k) and is the main trigger of
+        Nord's per-IP auth rate limit. On scan errors the previous cache is
+        returned so a rate-limited pass can't empty the provider.
+        """
+        import time as _time
+        now = _time.monotonic()
+        if (not force and self._scan_cache is not None
+                and (now - self._last_scan_monotonic) < self.scan_interval_s):
+            return self._scan_cache
         tasks = [self.nordhold_endpoints()]
         if self.port89:
             tasks.append(self.scan_port89())
-        groups = await asyncio.gather(*tasks)
-        seen: dict[str, str] = {}
-        for group in groups:
-            for url in group:
-                seen.setdefault(url, url)
-        return list(seen)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        merged: list[str] = []
+        for r in results:
+            if isinstance(r, list):
+                for url in r:
+                    if url not in merged:
+                        merged.append(url)
+        if not merged and self._scan_cache is not None:
+            return self._scan_cache    # scan failed / empty → keep previous
+        self._scan_cache = merged
+        self._last_scan_monotonic = now
+        return merged

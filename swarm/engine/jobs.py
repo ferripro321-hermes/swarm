@@ -36,6 +36,7 @@ class Engine:
         self._refresh_task: asyncio.Task | None = None
         self._nord_retry_at: dict[str, float] = {}   # url -> earliest re-bench time (throttle backoff)
         self._sched: dict[int, asyncio.Task] = {}    # job_id -> active schedule task
+        self._dry_passes: int = 0                    # consecutive bench passes with 0 ready
 
     # ── job creation ───────────────────────────────────────────────────
     async def create_job(self, link: str, dest: str | None = None) -> int:
@@ -356,11 +357,18 @@ class Engine:
                 self.store.add_event("proxy", f"bench pass done; pool stats: {self.pool.stats()}")
             except Exception as e:
                 self.store.add_event("error", f"refresh loop: {e}")
-            # cadence: nord pool dry → rescan almost immediately (fresh exits
-            # are the recovery path); nord healthy → 5 min; public → 30 min
+            # cadence: nord pool dry → rescan, but back off progressively —
+            # hammering Nord's auth endpoint while rate-limited only extends
+            # the throttle window (90 s → 3 → 6 → … cap 15 min). Healthy nord
+            # → 5 min; public → refresh_min.
             if cfg.mode == "nord":
                 stats = self.pool.stats()
-                wait = 90.0 if stats.get("ready", 0) == 0 else 300.0
+                if stats.get("ready", 0) > 0:
+                    self._dry_passes = 0
+                    wait = 300.0
+                else:
+                    self._dry_passes += 1
+                    wait = min(90.0 * (2 ** (self._dry_passes - 1)), 900.0)
             else:
                 wait = cfg.refresh_min * 60
             await asyncio.sleep(wait)
