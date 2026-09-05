@@ -171,8 +171,11 @@ class ProxyPool:
             self._throttle_strikes[url] = strikes
             self.store.add_event("throttle",
                                  f"{url} bench throttled x{strikes}; grade kept")
-            # row stays whatever it was — the engine only re-queues throttled
-            # URLs for benching with exponential backoff (bench_skip_minutes)
+            # Back to dead so the refresh loop doesn't re-bench it every pass;
+            # the score column is untouched (grade kept) and the engine's
+            # throttle backoff (_nord_retry_at) governs when it re-queues.
+            self.store.set_proxy_state(url, "dead", last_benched=True)
+            self._ready.pop(url, None)
             return
         self._throttle_strikes.pop(url, None)
         if ok and score and score > 0:
