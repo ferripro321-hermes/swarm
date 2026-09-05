@@ -349,11 +349,15 @@ class Engine:
 
                     await asyncio.gather(*(one(u) for u in urls))
 
-                # public haystack: wide flood. Nord curated set: gentle — their
-                # auth endpoints rate-limit per source IP, and a flood of
-                # concurrent handshakes 407s even valid endpoints into "dead".
+                # public haystack: wide flood. Nord curated set: TRICKLE — at
+                # most a few endpoints per pass, spaced ~1.5 s apart. Nord
+                # rate-limits CONNECT-auth per source IP; probing the whole
+                # set in one pass re-triggers the 407 window and scores the
+                # healthy endpoints as dead/throttled.
                 await bench_many(public_bench, 150)
-                await bench_many(nord_bench, 4)
+                for u in nord_bench:
+                    await bench_many([u], 1)
+                    await asyncio.sleep(1.5)
                 self.store.add_event("proxy", f"bench pass done; pool stats: {self.pool.stats()}")
             except Exception as e:
                 self.store.add_event("error", f"refresh loop: {e}")
@@ -386,8 +390,9 @@ class Engine:
 
         nord_bench = [p["url"] for p in pending if is_nord_url(p["url"])]
         public_bench = [p["url"] for p in pending if not is_nord_url(p["url"])]
-        # see refresh_proxies_forever: nord auth rate-limits per source IP
-        for urls, conc in ((public_bench, 150), (nord_bench, 4)):
+        # see refresh_proxies_forever: nord auth rate-limits per source IP —
+        # manual passes trickle nord endpoints too
+        for urls, conc in ((public_bench, 150), (nord_bench, 1)):
             sem = asyncio.Semaphore(conc)
 
             async def one(url: str):

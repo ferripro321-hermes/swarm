@@ -215,7 +215,16 @@ class ThrottledError(Exception):
 
 
 def is_throttle_error(e: Exception) -> bool:
-    """True when an exception looks like proxy throttling, not a hard fail."""
+    """True when an exception looks like proxy throttling, not a hard fail.
+
+    Timeouts count: Nord's throttle window manifests as stalls/timeouts during
+    the CONNECT/auth handshake (tunnels hang), so killing the endpoint for a
+    timeout would let the throttle window destroy the pool. Truly dead
+    endpoints fail with DNS/refused errors, which stay 'fail'.
+    """
+    import asyncio as _aio
+    if isinstance(e, _aio.TimeoutError):
+        return True
     status = getattr(e, "status", None)
     if status in (407, 502, 503, 429):
         return True
