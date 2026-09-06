@@ -135,6 +135,37 @@ class Store:
             ).fetchall()
         return [self._job_to_dict(r, with_files=True) for r in rows]
 
+    def jobs_summary(self) -> list[dict[str, Any]]:
+        """Lightweight per-job aggregates for the dashboard's 1 Hz poll.
+
+        SQL-side counts + sums, plus the handful of in-flight file rows the
+        UI actually animates — never the full file list (5k+ rows).
+        """
+        with self._conn() as c:
+            rows = c.execute(
+                """SELECT j.id, j.link, j.dest, j.status,
+                          COUNT(f.id) AS files_total,
+                          COALESCE(SUM(f.status='done'), 0)      AS files_done,
+                          COALESCE(SUM(f.status IN ('failed','corrupt')), 0) AS files_failed,
+                          COALESCE(SUM(f.status='downloading'), 0) AS files_downloading,
+                          COALESCE(SUM(f.bytes_done), 0) AS bytes_done,
+                          COALESCE(SUM(f.size), 0)       AS bytes_total
+                   FROM jobs j LEFT JOIN files f ON f.job_id = j.id
+                   GROUP BY j.id ORDER BY j.id DESC"""
+            ).fetchall()
+            out = []
+            for r in rows:
+                d = dict(r)
+                act = c.execute(
+                    """SELECT id, name, relpath, status, bytes_done, size, error
+                       FROM files WHERE job_id=? AND status IN ('downloading','verifying')
+                       ORDER BY bytes_done * 1.0 / size DESC""",
+                    (d["id"],),
+                ).fetchall()
+                d["active"] = [dict(x) for x in act]
+                out.append(d)
+            return out
+
     def set_job_status(self, job_id: int, status: str) -> None:
         with self._conn() as c:
             c.execute(
@@ -159,6 +190,31 @@ class Store:
                 "SELECT id FROM files WHERE job_id=? AND relpath=?", (job_id, relpath)
             ).fetchone()
             return int(row["id"])
+
+    def list_files(self, job_id: int, *, status: str | None = None, q: str | None = None,
+                   sort: str = "bytes_done", dir: str = "desc", limit: int = 100,
+                   offset: int = 0) -> tuple[list[dict[str, Any]], int]:
+        """Filtered/paginated file rows for the dashboard's lazy file lists."""
+        sorts = {"bytes_done": "bytes_done", "size": "size", "name": "name", "id": "id"}
+        sort_col = sorts.get(sort, "bytes_done")
+        order = "ASC" if str(dir).lower() == "asc" else "DESC"
+        where = "job_id=?"
+        args: list[Any] = [job_id]
+        if status:
+            where += " AND status=?"
+            args.append(status)
+        if q:
+            where += " AND name LIKE ?"
+            args.append(f"%{q}%")
+        with self._conn() as c:
+            total = c.execute(f"SELECT COUNT(*) FROM files WHERE {where}", args).fetchone()[0]
+            rows = c.execute(
+                f"""SELECT id, name, relpath, status, bytes_done, size, error
+                    FROM files WHERE {where}
+                    ORDER BY {sort_col} {order} LIMIT ? OFFSET ?""",
+                [*args, int(limit), int(offset)],
+            ).fetchall()
+        return [dict(r) for r in rows], int(total)
 
     def get_file(self, file_id: int) -> dict[str, Any] | None:
         with self._conn() as c:

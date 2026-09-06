@@ -41,6 +41,23 @@ def make_api_blueprint(engine, store: Store, loop) -> Blueprint:
     def list_jobs():
         return jsonify(jobs=store.list_jobs())
 
+    @bp.get("/jobs/summary")
+    def jobs_summary():
+        return jsonify(jobs=store.jobs_summary())
+
+    @bp.get("/jobs/<int:job_id>/files")
+    def list_job_files(job_id: int):
+        files, total = store.list_files(
+            job_id,
+            status=request.args.get("status") or None,
+            q=request.args.get("q") or None,
+            sort=request.args.get("sort", "bytes_done"),
+            dir=request.args.get("dir", "desc"),
+            limit=min(int(request.args.get("limit", 100)), 500),
+            offset=int(request.args.get("offset", 0)),
+        )
+        return jsonify(files=files, total=total)
+
     @bp.get("/jobs/<int:job_id>")
     def get_job(job_id: int):
         job = store.get_job(job_id)

@@ -8,8 +8,14 @@
 </head>
 <body>
 <header>
-  <h1>🐝 <span class="accent">Swarm</span></h1>
-  <div class="proxy-summary" id="proxy-summary"></div>
+  <div class="brand">
+    <h1>🐝 <span class="accent">Swarm</span></h1>
+    <div class="proxy-summary" id="proxy-summary"></div>
+  </div>
+  <div class="speedbox" id="speedbox" title="Global throughput (5s EMA)">
+    <canvas id="sparkline" width="132" height="30"></canvas>
+    <div class="speed-num"><span id="speed-val">—</span><span class="speed-unit">/s</span></div>
+  </div>
 </header>
 
 <main>
@@ -26,7 +32,7 @@
   <section class="card">
     <div class="card-head">
       <h2>Jobs</h2>
-      <button class="ghost" onclick="loadJobs()">Refresh</button>
+      <button class="ghost" onclick="loadJobs(true)">Refresh</button>
     </div>
     <div id="jobs"></div>
   </section>
@@ -44,7 +50,17 @@
   </section>
 
   <section class="card">
-    <h2>Event log</h2>
+    <div class="card-head">
+      <h2>Event log</h2>
+      <div class="kind-filter" id="kind-filter">
+        <button class="ghost kbtn active" data-k="all">all</button>
+        <button class="ghost kbtn" data-k="file">file</button>
+        <button class="ghost kbtn" data-k="job">job</button>
+        <button class="ghost kbtn" data-k="proxy">proxy</button>
+        <button class="ghost kbtn" data-k="throttle">throttle</button>
+        <button class="ghost kbtn" data-k="error">error</button>
+      </div>
+    </div>
     <div id="events" class="events"></div>
   </section>
 </main>
@@ -57,6 +73,8 @@
     <button onclick="doImport()">Import</button>
   </div>
 </dialog>
+
+<div id="toasts"></div>
 
 <script src="/static/app.js"></script>
 </body>
